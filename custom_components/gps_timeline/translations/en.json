@@ -1,0 +1,65 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add a tracked device",
+        "description": "GPS Timeline archives the location history of one entity so it is never purged.",
+        "data": {
+          "entity_id": "Tracker entity",
+          "places_entity": "Places sensor (optional)",
+          "activity_entity": "Activity sensor (optional)",
+          "accuracy_threshold": "Maximum GPS accuracy (meters)"
+        },
+        "data_description": {
+          "entity_id": "Any entity exposing latitude/longitude attributes, e.g. device_tracker.my_phone or person.alice.",
+          "places_entity": "Places integration sensor whose labels are archived alongside the GPS points.",
+          "activity_entity": "Sensor whose state describes the current activity, e.g. walking or driving.",
+          "accuracy_threshold": "GPS fixes with an accuracy worse than this are ignored. Set to 0 to keep every fix."
+        }
+      }
+    },
+    "error": {
+      "missing_coordinates": "The selected entity does not expose latitude/longitude attributes."
+    },
+    "abort": {
+      "already_configured": "This entity is already tracked by GPS Timeline."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "GPS Timeline options",
+        "data": {
+          "places_entity": "Places sensor (optional)",
+          "activity_entity": "Activity sensor (optional)",
+          "accuracy_threshold": "Maximum GPS accuracy (meters)"
+        },
+        "data_description": {
+          "places_entity": "Places integration sensor whose labels are archived alongside the GPS points.",
+          "activity_entity": "Sensor whose state describes the current activity, e.g. walking or driving.",
+          "accuracy_threshold": "GPS fixes with an accuracy worse than this are ignored. Set to 0 to keep every fix."
+        }
+      }
+    }
+  },
+  "services": {
+    "backfill": {
+      "name": "Backfill history from recorder",
+      "description": "Imports existing location history from the Home Assistant recorder database into the GPS Timeline archive.",
+      "fields": {
+        "entity_id": {
+          "name": "Tracker entity",
+          "description": "The entity tracked by GPS Timeline whose history should be imported."
+        },
+        "start_time": {
+          "name": "Start time",
+          "description": "Earliest point to import. Defaults to 10 days before the end time."
+        },
+        "end_time": {
+          "name": "End time",
+          "description": "Latest point to import. Defaults to now."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,30 @@
+backfill:
+  name: Backfill history from recorder
+  description: >-
+    Imports existing location history from the Home Assistant recorder database
+    into the GPS Timeline archive so older days are available before the recorder
+    purges them.
+  fields:
+    entity_id:
+      name: Tracker entity
+      description: The entity tracked by GPS Timeline whose history should be imported.
+      required: true
+      selector:
+        entity:
+          filter:
+            - domain: device_tracker
+            - domain: person
+            - domain: sensor
+            - domain: geo_location
+    start_time:
+      name: Start time
+      description: Earliest point to import. Defaults to 10 days before the end time.
+      required: false
+      selector:
+        datetime:
+    end_time:
+      name: End time
+      description: Latest point to import. Defaults to now.
+      required: false
+      selector:
+        datetime:

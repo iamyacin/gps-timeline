@@ -1,0 +1,13 @@
+{
+  "domain": "gps_timeline",
+  "name": "GPS Timeline",
+  "codeowners": ["@iamyacin"],
+  "config_flow": true,
+  "documentation": "https://github.com/iamyacin/gps-timeline",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/iamyacin/gps-timeline/issues",
+  "after_dependencies": ["recorder"],
+  "requirements": [],
+  "version": "0.1.0"
+}
