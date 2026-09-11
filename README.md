@@ -42,7 +42,7 @@ Copy `custom_components/gps_timeline` into the `custom_components` directory of 
 ## Configuration
 
 1. Go to **Settings → Devices & services → Add integration** and search for **GPS Timeline**.
-2. Pick the entity to track (one entry per device) and optionally select a **Places sensor** and an **activity sensor** to archive alongside it.
+2. Pick the entity to track (one entry per device) and optionally select a **Places sensor** and an **activity sensor** to archive alongside it. Choose the main `sensor.places_*` entity: with Places v3, its `..._place_name` child sensor is resolved and archived automatically.
 3. Set the **maximum GPS accuracy** (default 100 m): fixes with worse accuracy are ignored. Set it to 0 to keep every fix.
 
 Repeat for each additional person or device. Deleting an entry removes the listener and the exposed entity but **keeps the archived data**.
@@ -63,6 +63,7 @@ places_entity:
 - The card keeps pointing at the same entity IDs — GPS Timeline serves the data transparently.
 - `history_source: gps_timeline` activates the backend; when the flag is not set (or the integration is not installed), the card behaves exactly as before.
 - Companion `places_entity`/`activity_entity` queries are served from the archive too, so old days still show place names and activities.
+- Configure the **main** `sensor.places_*` entity as the companion; if Places v3 exposes a separate `..._place_name` child sensor, GPS Timeline finds and archives it automatically.
 
 You can point the card at either the original tracker entity or the exposed `device_tracker.*` entity — both work.
 

@@ -77,7 +77,7 @@ async def _async_handle_backfill(call: ServiceCall) -> None:
         raise HomeAssistantError("start_time must be before end_time")
 
     tracker_id = await store.async_ensure_tracker(entity_id)
-    query_entity_ids = tracked_entity_ids(entry)
+    query_entity_ids = tracked_entity_ids(hass, entry)
     threshold = entry_setting(entry, CONF_ACCURACY_THRESHOLD, DEFAULT_ACCURACY_THRESHOLD)
 
     result = await _recorder_instance(hass).async_add_executor_job(

@@ -70,7 +70,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     tracker_id = await store.async_ensure_tracker(source_entity_id)
 
     listeners = data.setdefault("listeners", {})
-    entity_ids = tracked_entity_ids(entry)
+    entity_ids = tracked_entity_ids(hass, entry)
 
     @callback
     def _handle_state_change(event: Event[EventStateChangedData]) -> None:

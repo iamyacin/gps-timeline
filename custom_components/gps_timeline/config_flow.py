@@ -100,7 +100,7 @@ class GPSTimelineConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return OptionsFlowHandler()
 
 
-class OptionsFlowHandler(config_entries.OptionsFlow):
+class OptionsFlowHandler(config_entries.OptionsFlowWithReload):
     """Handle GPS Timeline options."""
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None):
