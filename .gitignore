@@ -9,4 +9,5 @@ venv/
 htmlcov/
 dist/
 build/
+misc/
 .DS_Store

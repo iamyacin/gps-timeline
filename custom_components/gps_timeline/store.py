@@ -247,8 +247,8 @@ class Store:
             raise
         await self.async_flush()
 
-    async def async_flush(self) -> None:
-        if self._closed:
+    async def async_flush(self, *, final: bool = False) -> None:
+        if self._closed and not final:
             return
         points = self._pending_points
         states = self._pending_states
@@ -502,12 +502,12 @@ class Store:
     async def async_close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         if self._flush_task is not None and not self._flush_task.done():
             self._flush_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._flush_task
-        await self.async_flush()
+        self._closed = True
+        await self.async_flush(final=True)
         await asyncio.to_thread(self._close)
 
     def _close(self) -> None:

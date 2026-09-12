@@ -237,3 +237,45 @@ async def test_write_backfill_dedup(store):
 async def test_close_is_idempotent(store):
     await store.async_close()
     await store.async_close()
+
+
+async def test_close_flushes_pending_points(tmp_path):
+    db_path = str(tmp_path / "gps_timeline" / "gps_timeline.db")
+    store = Store(FakeHass(), db_path)
+    await store.async_setup()
+    tracker_id = await store.async_ensure_tracker("device_tracker.phone")
+    store.async_add_point(
+        tracker_id, normalize_point(make_state(attrs=TRACKER_ATTRS, ts=100.0))
+    )
+    await store.async_close()
+
+    reopened = Store(FakeHass(), db_path)
+    await reopened.async_setup()
+    try:
+        result = await reopened.async_query_states(["device_tracker.phone"], 0, 1000)
+        items = result["device_tracker.phone"]
+        assert len(items) == 1
+        assert items[0]["lu"] == 100.0
+    finally:
+        await reopened.async_close()
+
+
+async def test_close_flushes_pending_entity_states(tmp_path):
+    db_path = str(tmp_path / "gps_timeline" / "gps_timeline.db")
+    store = Store(FakeHass(), db_path)
+    await store.async_setup()
+    tracker_id = await store.async_ensure_tracker("device_tracker.phone")
+    store.async_add_entity_state(
+        tracker_id, "sensor.places_phone", (100.0, "Home", json.dumps({}))
+    )
+    await store.async_close()
+
+    reopened = Store(FakeHass(), db_path)
+    await reopened.async_setup()
+    try:
+        result = await reopened.async_query_states(["sensor.places_phone"], 0, 1000)
+        items = result["sensor.places_phone"]
+        assert len(items) == 1
+        assert items[0]["s"] == "Home"
+    finally:
+        await reopened.async_close()
