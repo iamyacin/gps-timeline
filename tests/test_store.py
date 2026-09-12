@@ -505,8 +505,7 @@ async def test_failed_migration_rolls_back(tmp_path, monkeypatch):
     conn = sqlite3.connect(db_path)
     assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
     tables = {
-        row[0]
-        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
     assert "migration_marker" not in tables
     conn.close()
