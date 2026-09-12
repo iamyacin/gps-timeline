@@ -196,6 +196,17 @@ def normalize_entity_state(state: State) -> tuple:
     return (ts, state.state, _dumps(state.attributes))
 
 
+def _filter_significant_changes(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop consecutive rows whose state and attributes are unchanged."""
+    significant: list[dict[str, Any]] = []
+    for item in items:
+        last = significant[-1] if significant else None
+        if last is not None and item["s"] == last["s"] and item["a"] == last["a"]:
+            continue
+        significant.append(item)
+    return significant
+
+
 class Store:
     """SQLite storage for GPS timeline points, never purged."""
 
@@ -422,6 +433,7 @@ class Store:
         no_attributes: bool = False,
         minimal_response: bool = False,
         include_start_time_state: bool = True,
+        significant_changes_only: bool = False,
     ) -> dict[str, list[dict[str, Any]]]:
         return await asyncio.to_thread(
             self._query_states,
@@ -431,6 +443,7 @@ class Store:
             no_attributes,
             minimal_response,
             include_start_time_state,
+            significant_changes_only,
         )
 
     def _query_states(
@@ -441,6 +454,7 @@ class Store:
         no_attributes: bool,
         minimal_response: bool,
         include_start_time_state: bool,
+        significant_changes_only: bool,
     ) -> dict[str, list[dict[str, Any]]]:
         with self._conn_lock:
             if self._conn is None:
@@ -472,6 +486,8 @@ class Store:
                     )
                 )
                 items.sort(key=lambda item: item["lu"])
+                if significant_changes_only:
+                    items = _filter_significant_changes(items)
                 if minimal_response:
                     for item in items[1:]:
                         item["a"] = {}

@@ -39,9 +39,14 @@ async def setup_entry(hass):
     return entry
 
 
+_next_msg_id = 0
+
+
 async def query(client, **overrides):
+    global _next_msg_id
+    _next_msg_id += 1
     message = {
-        "id": 1,
+        "id": _next_msg_id,
         "type": WS_HISTORY_DURING_PERIOD,
         "start_time": "2020-01-01T00:00:00+00:00",
         "end_time": "2100-01-01T00:00:00+00:00",
@@ -112,3 +117,21 @@ async def test_history_future_start_time_returns_empty(hass, hass_ws_client):
     msg = await query(client, start_time="2100-06-01T00:00:00+00:00")
     assert msg["success"]
     assert msg["result"] == {}
+
+
+async def test_history_significant_changes_only(hass, hass_ws_client):
+    await setup_entry(hass)
+    hass.states.async_set("device_tracker.phone", "not_home", TRACKER_ATTRS)
+    await hass.data[DOMAIN]["store"].async_flush()
+    hass.states.async_set("device_tracker.phone", "not_home", TRACKER_ATTRS, force_update=True)
+    await hass.async_block_till_done()
+    await hass.data[DOMAIN]["store"].async_flush()
+
+    client = await hass_ws_client(hass)
+    msg = await query(client, significant_changes_only=True)
+    assert msg["success"]
+    assert len(msg["result"]["device_tracker.phone"]) == 1
+
+    msg = await query(client, significant_changes_only=False)
+    assert msg["success"]
+    assert len(msg["result"]["device_tracker.phone"]) == 2

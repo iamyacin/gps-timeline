@@ -95,6 +95,7 @@ async def _handle_history_during_period(
         no_attributes=msg["no_attributes"],
         minimal_response=msg["minimal_response"],
         include_start_time_state=msg["include_start_time_state"],
+        significant_changes_only=msg["significant_changes_only"],
     )
 
     response: dict[str, list[dict[str, Any]]] = {}

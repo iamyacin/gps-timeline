@@ -188,6 +188,30 @@ async def test_include_start_time_state(store):
     assert "device_tracker.phone" not in result
 
 
+async def test_significant_changes_only_filters_duplicates(store):
+    tracker_id = await store.async_ensure_tracker("device_tracker.phone")
+    moved = {**TRACKER_ATTRS, "latitude": 51.0, "longitude": 9.0}
+    store.async_add_points(
+        tracker_id,
+        [
+            normalize_point(make_state(attrs=TRACKER_ATTRS, ts=100.0)),
+            normalize_point(make_state(attrs=TRACKER_ATTRS, ts=200.0)),
+            normalize_point(make_state(attrs=moved, ts=300.0)),
+            normalize_point(make_state(attrs=moved, ts=400.0)),
+            normalize_point(make_state("home", attrs=moved, ts=500.0)),
+        ],
+    )
+    await store.async_flush()
+
+    result = await store.async_query_states(
+        ["device_tracker.phone"], 0, 1000, significant_changes_only=True
+    )
+    assert [item["lu"] for item in result["device_tracker.phone"]] == [100.0, 300.0, 500.0]
+
+    result = await store.async_query_states(["device_tracker.phone"], 0, 1000)
+    assert len(result["device_tracker.phone"]) == 5
+
+
 async def test_entity_states_roundtrip(store):
     tracker_id = await store.async_ensure_tracker("device_tracker.phone")
     store.async_add_entity_state(
