@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 
 from homeassistant.core import State
 from homeassistant.util import dt as dt_util
@@ -279,3 +280,79 @@ async def test_close_flushes_pending_entity_states(tmp_path):
         assert items[0]["s"] == "Home"
     finally:
         await reopened.async_close()
+
+
+async def test_flush_failure_requeues_and_retries(tmp_path, monkeypatch):
+    monkeypatch.setattr("custom_components.gps_timeline.store.FLUSH_INTERVAL", 0.01)
+    db_path = str(tmp_path / "gps_timeline" / "gps_timeline.db")
+    store = Store(FakeHass(), db_path)
+    await store.async_setup()
+    tracker_id = await store.async_ensure_tracker("device_tracker.phone")
+
+    calls = {"count": 0}
+    original_write = store._write
+
+    def flaky_write(points, states):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        original_write(points, states)
+
+    monkeypatch.setattr(store, "_write", flaky_write)
+
+    store.async_add_point(
+        tracker_id, normalize_point(make_state(attrs=TRACKER_ATTRS, ts=100.0))
+    )
+    await store.async_flush()
+    assert calls["count"] == 1
+    assert len(store._pending_points) == 1
+
+    await asyncio.sleep(0.1)
+    assert calls["count"] == 2
+    assert not store._pending_points
+
+    result = await store.async_query_states(["device_tracker.phone"], 0, 1000)
+    assert [item["lu"] for item in result["device_tracker.phone"]] == [100.0]
+    await store.async_close()
+
+
+async def test_requeue_caps_pending_rows(tmp_path, monkeypatch):
+    monkeypatch.setattr("custom_components.gps_timeline.store.MAX_PENDING_ROWS", 3)
+    db_path = str(tmp_path / "gps_timeline" / "gps_timeline.db")
+    store = Store(FakeHass(), db_path)
+    await store.async_setup()
+    tracker_id = await store.async_ensure_tracker("device_tracker.phone")
+
+    def broken_write(points, states):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "_write", broken_write)
+
+    store.async_add_points(
+        tracker_id,
+        [
+            normalize_point(make_state(attrs=TRACKER_ATTRS, ts=ts))
+            for ts in (100.0, 200.0, 300.0, 400.0, 500.0)
+        ],
+    )
+    await store.async_flush()
+    assert [row[1][0] for row in store._pending_points] == [300.0, 400.0, 500.0]
+
+    await store.async_close()
+
+
+async def test_close_with_failing_write_does_not_raise(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "gps_timeline" / "gps_timeline.db")
+    store = Store(FakeHass(), db_path)
+    await store.async_setup()
+    tracker_id = await store.async_ensure_tracker("device_tracker.phone")
+
+    def broken_write(points, states):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, "_write", broken_write)
+    store.async_add_point(
+        tracker_id, normalize_point(make_state(attrs=TRACKER_ATTRS, ts=100.0))
+    )
+    await store.async_close()
+    assert store._closed

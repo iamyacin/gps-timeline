@@ -18,6 +18,8 @@ from .const import (
     DEFAULT_ACCURACY_THRESHOLD,
     FLUSH_BATCH_SIZE,
     FLUSH_INTERVAL,
+    MAX_PENDING_ROWS,
+    MAX_RETRY_DELAY,
 )
 
 SCHEMA_VERSION = 1
@@ -198,6 +200,8 @@ class Store:
         self._pending_points: list[tuple[int, tuple]] = []
         self._pending_states: list[tuple[int, tuple]] = []
         self._flush_task: asyncio.Task | None = None
+        self._retry_tasks: set[asyncio.Task] = set()
+        self._flush_failure_count = 0
         self._closed = False
 
     async def async_setup(self) -> None:
@@ -240,12 +244,21 @@ class Store:
         if self._flush_task is None or self._flush_task.done():
             self._flush_task = self._hass.async_create_task(self._async_delayed_flush())
 
-    async def _async_delayed_flush(self) -> None:
+    async def _async_delayed_flush(self, delay: float = FLUSH_INTERVAL) -> None:
         try:
-            await asyncio.sleep(FLUSH_INTERVAL)
+            await asyncio.sleep(delay)
         except asyncio.CancelledError:
             raise
         await self.async_flush()
+
+    @callback
+    def _schedule_retry(self) -> None:
+        if self._closed:
+            return
+        delay = min(FLUSH_INTERVAL * 2 ** (self._flush_failure_count - 1), MAX_RETRY_DELAY)
+        task = self._hass.async_create_task(self._async_delayed_flush(delay))
+        self._retry_tasks.add(task)
+        task.add_done_callback(self._retry_tasks.discard)
 
     async def async_flush(self, *, final: bool = False) -> None:
         if self._closed and not final:
@@ -256,7 +269,36 @@ class Store:
         self._pending_states = []
         if not points and not states:
             return
-        await asyncio.to_thread(self._write, points, states)
+        try:
+            await asyncio.to_thread(self._write, points, states)
+        except Exception:
+            self._flush_failure_count += 1
+            _LOGGER.exception(
+                "Failed to write %s points and %s entity states; re-queueing for retry",
+                len(points),
+                len(states),
+            )
+            self._requeue(points, states)
+            if not final:
+                self._schedule_retry()
+        else:
+            self._flush_failure_count = 0
+
+    def _requeue(
+        self, points: list[tuple[int, tuple]], states: list[tuple[int, tuple]]
+    ) -> None:
+        self._pending_points[:0] = points
+        self._pending_states[:0] = states
+        for name, pending in (
+            ("points", self._pending_points),
+            ("entity states", self._pending_states),
+        ):
+            overflow = len(pending) - MAX_PENDING_ROWS
+            if overflow > 0:
+                del pending[:overflow]
+                _LOGGER.warning(
+                    "Pending %s queue overflow; dropped %s oldest rows", name, overflow
+                )
 
     def _write(self, points: list[tuple[int, tuple]], states: list[tuple[int, tuple]]) -> None:
         with self._conn_lock:
@@ -506,6 +548,10 @@ class Store:
             self._flush_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._flush_task
+        if self._retry_tasks:
+            for task in self._retry_tasks:
+                task.cancel()
+            await asyncio.gather(*self._retry_tasks, return_exceptions=True)
         self._closed = True
         await self.async_flush(final=True)
         await asyncio.to_thread(self._close)
