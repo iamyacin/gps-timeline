@@ -478,3 +478,35 @@ async def test_migration_runs_and_data_survives(tmp_path, monkeypatch):
         conn.close()
     finally:
         await reopened.async_close()
+
+
+async def test_failed_migration_rolls_back(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "gps_timeline" / "gps_timeline.db")
+    store = Store(FakeHass(), db_path)
+    await store.async_setup()
+    await store.async_close()
+
+    def broken_migration(conn):
+        conn.execute("CREATE TABLE IF NOT EXISTS migration_marker (done INTEGER)")
+        conn.execute("INSERT INTO migration_marker (done) VALUES (1)")
+        raise sqlite3.OperationalError("boom")
+
+    monkeypatch.setattr(
+        "custom_components.gps_timeline.store._MIGRATIONS", {1: broken_migration}
+    )
+    monkeypatch.setattr("custom_components.gps_timeline.store.SCHEMA_VERSION", 2)
+
+    reopened = Store(FakeHass(), db_path)
+    with pytest.raises(StoreError, match="Migration from schema version 1 failed"):
+        await reopened.async_setup()
+
+    assert reopened.corrupt_backup_path is None
+    assert not list(tmp_path.rglob("*.corrupt-*"))
+    conn = sqlite3.connect(db_path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    tables = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert "migration_marker" not in tables
+    conn.close()

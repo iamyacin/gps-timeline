@@ -274,12 +274,26 @@ class Store:
                 f" version {SCHEMA_VERSION}; upgrade the integration"
             )
         if version > 0:
-            for from_version in range(version, SCHEMA_VERSION):
-                migration = _MIGRATIONS.get(from_version)
-                if migration is None:
-                    raise StoreError(f"No migration from schema version {from_version}")
-                _LOGGER.info("Migrating database from schema version %s", from_version)
-                migration(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for from_version in range(version, SCHEMA_VERSION):
+                    migration = _MIGRATIONS.get(from_version)
+                    if migration is None:
+                        raise StoreError(f"No migration from schema version {from_version}")
+                    _LOGGER.info("Migrating database from schema version %s", from_version)
+                    migration(conn)
+                conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            except sqlite3.DatabaseError as err:
+                conn.rollback()
+                if _is_lock_error(err):
+                    raise
+                raise StoreError(
+                    f"Migration from schema version {version} failed: {err}"
+                ) from err
+            except Exception:
+                conn.rollback()
+                raise
+            conn.commit()
         conn.executescript(_SCHEMA)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         conn.commit()
