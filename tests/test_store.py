@@ -356,3 +356,35 @@ async def test_close_with_failing_write_does_not_raise(tmp_path, monkeypatch):
     )
     await store.async_close()
     assert store._closed
+
+
+async def test_corrupt_db_archived_and_recreated(tmp_path):
+    db_path = tmp_path / "gps_timeline" / "gps_timeline.db"
+    db_path.parent.mkdir(parents=True)
+    db_path.write_bytes(b"this is not a sqlite database")
+
+    store = Store(FakeHass(), str(db_path))
+    await store.async_setup()
+    try:
+        backup = store.corrupt_backup_path
+        assert backup is not None
+        assert backup.exists()
+        assert backup.read_bytes() == b"this is not a sqlite database"
+        assert list(db_path.parent.glob("*.corrupt-*")) == [backup]
+
+        tracker_id = await store.async_ensure_tracker("device_tracker.phone")
+        store.async_add_point(
+            tracker_id, normalize_point(make_state(attrs=TRACKER_ATTRS, ts=100.0))
+        )
+        await store.async_flush()
+        result = await store.async_query_states(["device_tracker.phone"], 0, 1000)
+        assert len(result["device_tracker.phone"]) == 1
+    finally:
+        await store.async_close()
+
+    assert db_path.exists()
+
+
+async def test_healthy_db_not_archived(store, tmp_path):
+    assert store.corrupt_backup_path is None
+    assert not list(tmp_path.rglob("*.corrupt-*"))

@@ -42,6 +42,12 @@
       }
     }
   },
+  "issues": {
+    "corrupt_database": {
+      "title": "GPS Timeline database was corrupted",
+      "description": "The GPS Timeline database could not be opened. The corrupt file was moved to `{backup_path}` and a new empty database was created. Location history archived before this point is only available in the backup file."
+    }
+  },
   "services": {
     "backfill": {
       "name": "Backfill history from recorder",

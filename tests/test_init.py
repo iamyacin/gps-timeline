@@ -1,3 +1,6 @@
+from pathlib import Path
+
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -6,6 +9,8 @@ from custom_components.gps_timeline.const import (
     CONF_ACTIVITY_ENTITY,
     CONF_ENTITY_ID,
     CONF_PLACES_ENTITY,
+    DB_DIR_NAME,
+    DB_FILE_NAME,
     DOMAIN,
 )
 
@@ -119,3 +124,31 @@ async def test_companion_entities_archived(hass):
     state = hass.states.get("device_tracker.gps_timeline_phone_timeline")
     assert state is None or state.state == "unavailable"
     assert DOMAIN not in hass.data or "store" not in hass.data[DOMAIN]
+
+
+async def test_corrupt_db_creates_repair_issue(hass):
+    db_path = Path(hass.config.path(DB_DIR_NAME, DB_FILE_NAME))
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"this is not a sqlite database")
+
+    await setup_entry(hass)
+
+    registry = ir.async_get(hass)
+    issue = registry.issues.get((DOMAIN, "corrupt_database"))
+    assert issue is not None
+    assert issue.translation_key == "corrupt_database"
+    backup_path = issue.data["backup_path"]
+    assert Path(backup_path).exists()
+
+    hass.states.async_set("device_tracker.phone", "not_home", TRACKER_ATTRS)
+    await flush_store(hass)
+    store = hass.data[DOMAIN]["store"]
+    now = dt_util.utcnow().timestamp()
+    result = await store.async_query_states(["device_tracker.phone"], now - 3600, now + 3600)
+    assert len(result["device_tracker.phone"]) == 1
+
+
+async def test_healthy_db_does_not_create_repair_issue(hass):
+    await setup_entry(hass)
+    registry = ir.async_get(hass)
+    assert (DOMAIN, "corrupt_database") not in registry.issues

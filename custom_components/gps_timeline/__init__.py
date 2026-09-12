@@ -5,7 +5,9 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import Event, EventStateChangedData, HomeAssistant, callback
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.issue_registry import IssueSeverity
 
 from .const import (
     CONF_ENTITY_ID,
@@ -20,7 +22,26 @@ from .websocket import async_register_websocket
 
 PLATFORMS = ["device_tracker"]
 
+_CORRUPT_DB_ISSUE_ID = "corrupt_database"
+
 _LOGGER = logging.getLogger(__name__)
+
+
+@callback
+def _update_corrupt_db_issue(hass: HomeAssistant, store: Store) -> None:
+    if (backup_path := store.corrupt_backup_path) is not None:
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            _CORRUPT_DB_ISSUE_ID,
+            is_fixable=False,
+            severity=IssueSeverity.ERROR,
+            translation_key=_CORRUPT_DB_ISSUE_ID,
+            data={"backup_path": str(backup_path)},
+            translation_placeholders={"backup_path": str(backup_path)},
+        )
+        return
+    ir.async_delete_issue(hass, DOMAIN, _CORRUPT_DB_ISSUE_ID)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -30,6 +51,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         store = Store(hass, hass.config.path(DB_DIR_NAME, DB_FILE_NAME))
         await store.async_setup()
         data["store"] = store
+        _update_corrupt_db_issue(hass, store)
 
         async def _handle_stop(_event: Event) -> None:
             await store.async_close()

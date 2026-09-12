@@ -125,6 +125,13 @@ def _dumps(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), default=str)
 
 
+def _is_lock_error(err: Exception) -> bool:
+    message = str(err).lower()
+    return isinstance(err, sqlite3.OperationalError) and (
+        "locked" in message or "busy" in message
+    )
+
+
 def normalize_point(
     state: State, accuracy_threshold: float = DEFAULT_ACCURACY_THRESHOLD
 ) -> tuple | None:
@@ -202,22 +209,60 @@ class Store:
         self._flush_task: asyncio.Task | None = None
         self._retry_tasks: set[asyncio.Task] = set()
         self._flush_failure_count = 0
+        self._corrupt_backup_path: Path | None = None
         self._closed = False
+
+    @property
+    def corrupt_backup_path(self) -> Path | None:
+        """Path of the archived corrupt database, if one was recovered from."""
+        return self._corrupt_backup_path
 
     async def async_setup(self) -> None:
         await asyncio.to_thread(self._setup)
 
     def _setup(self) -> None:
+        try:
+            self._open()
+            return
+        except sqlite3.DatabaseError as err:
+            if _is_lock_error(err):
+                raise
+            _LOGGER.error(
+                "GPS Timeline database %s is corrupt (%s); archiving it and starting fresh",
+                self._path,
+                err,
+            )
+        self._corrupt_backup_path = self._archive_corrupt_db()
+        try:
+            self._open()
+        except sqlite3.DatabaseError as err:
+            raise StoreError(f"Could not initialize database: {err}") from err
+
+    def _open(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self._path), timeout=30, check_same_thread=False)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.executescript(_SCHEMA)
-        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-        conn.commit()
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.executescript(_SCHEMA)
+            conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            conn.commit()
+        except sqlite3.DatabaseError:
+            conn.close()
+            raise
         with self._conn_lock:
             self._conn = conn
+
+    def _archive_corrupt_db(self) -> Path:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = self._path.with_name(f"{self._path.name}.corrupt-{stamp}")
+        self._path.rename(backup)
+        for suffix in ("-wal", "-shm"):
+            sidecar = self._path.with_name(f"{self._path.name}{suffix}")
+            if sidecar.exists():
+                sidecar.rename(backup.with_name(f"{backup.name}{suffix}"))
+        return backup
 
     @callback
     def async_add_point(self, tracker_id: int, row: tuple) -> None:
