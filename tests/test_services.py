@@ -109,6 +109,19 @@ async def test_backfill_unknown_entity_errors(hass):
         )
 
 
+async def test_backfill_without_recorder_errors(hass, monkeypatch):
+    await setup_entry(hass)
+
+    def no_recorder(hass):
+        raise KeyError("Expected recorder to be loaded")
+
+    monkeypatch.setattr(services, "get_instance", no_recorder)
+    with pytest.raises(HomeAssistantError, match="recorder"):
+        await hass.services.async_call(
+            DOMAIN, SERVICE_BACKFILL, {CONF_ENTITY_ID: "device_tracker.phone"}, blocking=True
+        )
+
+
 async def test_backfill_invalid_time_range_errors(hass, monkeypatch):
     await setup_entry(hass)
     monkeypatch.setattr(services, "_recorder_instance", lambda hass: FakeRecorderInstance())

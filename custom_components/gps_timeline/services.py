@@ -43,7 +43,12 @@ def _find_entry(hass: HomeAssistant, entity_id: str):
 
 
 def _recorder_instance(hass: HomeAssistant):
-    return get_instance(hass)
+    try:
+        return get_instance(hass)
+    except KeyError as err:
+        raise HomeAssistantError(
+            "The recorder integration is not available; backfill requires it"
+        ) from err
 
 
 @callback
