@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 import contextlib
 import json
 import logging
@@ -23,6 +24,8 @@ from .const import (
 )
 
 SCHEMA_VERSION = 1
+
+_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -256,14 +259,30 @@ class Store:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA foreign_keys=ON")
-            conn.executescript(_SCHEMA)
-            conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-            conn.commit()
-        except sqlite3.DatabaseError:
+            self._migrate(conn)
+        except (sqlite3.DatabaseError, StoreError):
             conn.close()
             raise
         with self._conn_lock:
             self._conn = conn
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version > SCHEMA_VERSION:
+            raise StoreError(
+                f"Database schema version {version} is newer than the supported"
+                f" version {SCHEMA_VERSION}; upgrade the integration"
+            )
+        if version > 0:
+            for from_version in range(version, SCHEMA_VERSION):
+                migration = _MIGRATIONS.get(from_version)
+                if migration is None:
+                    raise StoreError(f"No migration from schema version {from_version}")
+                _LOGGER.info("Migrating database from schema version %s", from_version)
+                migration(conn)
+        conn.executescript(_SCHEMA)
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        conn.commit()
 
     def _archive_corrupt_db(self) -> Path:
         stamp = time.strftime("%Y%m%d-%H%M%S")

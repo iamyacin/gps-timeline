@@ -6,7 +6,12 @@ from homeassistant.core import State
 from homeassistant.util import dt as dt_util
 import pytest
 
-from custom_components.gps_timeline.store import Store, normalize_entity_state, normalize_point
+from custom_components.gps_timeline.store import (
+    Store,
+    StoreError,
+    normalize_entity_state,
+    normalize_point,
+)
 
 
 class FakeHass:
@@ -412,3 +417,64 @@ async def test_corrupt_db_archived_and_recreated(tmp_path):
 async def test_healthy_db_not_archived(store, tmp_path):
     assert store.corrupt_backup_path is None
     assert not list(tmp_path.rglob("*.corrupt-*"))
+
+
+async def test_downgrade_newer_schema_rejected(tmp_path):
+    db_path = tmp_path / "gps_timeline" / "gps_timeline.db"
+    db_path.parent.mkdir(parents=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA user_version=99")
+    conn.commit()
+    conn.close()
+
+    store = Store(FakeHass(), str(db_path))
+    with pytest.raises(StoreError, match="newer"):
+        await store.async_setup()
+
+
+async def test_missing_migration_rejected(tmp_path, monkeypatch):
+    monkeypatch.setattr("custom_components.gps_timeline.store.SCHEMA_VERSION", 2)
+    db_path = tmp_path / "gps_timeline" / "gps_timeline.db"
+    db_path.parent.mkdir(parents=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA user_version=1")
+    conn.commit()
+    conn.close()
+
+    store = Store(FakeHass(), str(db_path))
+    with pytest.raises(StoreError, match="No migration"):
+        await store.async_setup()
+
+
+async def test_migration_runs_and_data_survives(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "gps_timeline" / "gps_timeline.db")
+    store = Store(FakeHass(), db_path)
+    await store.async_setup()
+    tracker_id = await store.async_ensure_tracker("device_tracker.phone")
+    store.async_add_point(
+        tracker_id, normalize_point(make_state(attrs=TRACKER_ATTRS, ts=100.0))
+    )
+    await store.async_flush()
+    await store.async_close()
+
+    def fake_migration(conn):
+        conn.execute("CREATE TABLE IF NOT EXISTS migration_marker (done INTEGER)")
+        conn.execute("INSERT INTO migration_marker (done) VALUES (1)")
+
+    monkeypatch.setattr(
+        "custom_components.gps_timeline.store._MIGRATIONS", {1: fake_migration}
+    )
+    monkeypatch.setattr("custom_components.gps_timeline.store.SCHEMA_VERSION", 2)
+
+    reopened = Store(FakeHass(), db_path)
+    await reopened.async_setup()
+    try:
+        result = await reopened.async_query_states(["device_tracker.phone"], 0, 1000)
+        assert len(result["device_tracker.phone"]) == 1
+
+        conn = sqlite3.connect(db_path)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("SELECT count(*) FROM migration_marker").fetchone()[0] == 1
+        conn.close()
+    finally:
+        await reopened.async_close()
