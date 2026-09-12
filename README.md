@@ -1,5 +1,10 @@
 # GPS Timeline
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="custom_components/gps_timeline/brand/dark_logo.png">
+  <img src="custom_components/gps_timeline/brand/logo.png" alt="GPS Timeline" width="200">
+</picture>
+
 **GPS Timeline** is a Home Assistant integration that archives the location history of your trackers into a dedicated SQLite database that is **never purged**, and serves that history back to dashboards through a WebSocket API — unlocking unlimited history depth for the [Location Timeline Card](https://community.home-assistant.io/t/location-timeline-card-to-easily-show-location-history/989513).
 
 By default, Home Assistant's recorder keeps entity history for only 10 days (`purge_keep_days`), and there is no per-entity retention option. GPS Timeline fixes that for location data: every GPS fix is stored in its own SQLite database with full attribute fidelity and stays there forever.
@@ -20,11 +25,17 @@ By default, Home Assistant's recorder keeps entity history for only 10 days (`pu
 
 ### HACS (recommended)
 
+Ensure that [HACS](https://hacs.xyz/) is installed
+
+<a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=custom-components&repository=places" target="_blank" rel="noreferrer noopener"><img src="https://my.home-assistant.io/badges/hacs_repository.svg" alt="Open your Home Assistant instance to download the places integration." /></a>
+
 1. Open **HACS → Integrations → ⋮ → Custom repositories**.
 2. Add this repository URL and set the category to **Integration**.
 3. Install **GPS Timeline**, then restart Home Assistant.
 
 ### Manual
+
+<a href="https://my.home-assistant.io/redirect/config_flow_start/?domain=places" target="_blank" rel="noreferrer noopener"><img src="https://my.home-assistant.io/badges/config_flow_start.svg" alt="Open your Home Assistant instance to create a places entry." /></a>
 
 Copy `custom_components/gps_timeline` into the `custom_components` directory of your Home Assistant configuration, then restart Home Assistant.
 
