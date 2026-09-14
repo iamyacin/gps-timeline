@@ -23,7 +23,7 @@ from .const import (
     MAX_RETRY_DELAY,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {}
 
@@ -33,8 +33,14 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS trackers (
     id INTEGER PRIMARY KEY,
     entity_id TEXT UNIQUE NOT NULL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    entry_id TEXT,
+    subject_kind TEXT,
+    subject_name TEXT
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trackers_entry
+    ON trackers(entry_id) WHERE entry_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS points (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,6 +73,20 @@ CREATE TABLE IF NOT EXISTS entity_states (
 
 CREATE INDEX IF NOT EXISTS idx_entity_states_entity_ts ON entity_states (entity_id, ts);
 """
+
+
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(trackers)")}
+    for column in ("entry_id", "subject_kind", "subject_name"):
+        if column not in columns:
+            conn.execute(f"ALTER TABLE trackers ADD COLUMN {column} TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_trackers_entry"
+        " ON trackers(entry_id) WHERE entry_id IS NOT NULL"
+    )
+
+
+_MIGRATIONS[1] = _migrate_v1_to_v2
 
 _INSERT_POINT_SQL = (
     "INSERT OR IGNORE INTO points"
@@ -437,25 +457,141 @@ class Store:
             inserted = self._conn.total_changes - before
         return (inserted, len(points) + len(states))
 
-    async def async_ensure_tracker(self, entity_id: str) -> int:
-        return await asyncio.to_thread(self._ensure_tracker, entity_id.lower())
+    async def async_bind_tracker(self, entry_id: str | None, entity_id: str) -> int:
+        return await asyncio.to_thread(self._bind_tracker, entry_id, entity_id.lower())
 
-    def _ensure_tracker(self, entity_id: str) -> int:
+    def _bind_tracker(self, entry_id: str | None, entity_id: str) -> int:
         with self._conn_lock:
             if self._conn is None:
                 raise StoreError("Store is not set up")
-            cursor = self._conn.execute(
-                "SELECT id FROM trackers WHERE entity_id = ?", (entity_id,)
-            )
-            row = cursor.fetchone()
-            if row:
-                return int(row[0])
-            cursor = self._conn.execute(
-                "INSERT INTO trackers (entity_id, created_at) VALUES (?, ?)",
-                (entity_id, time.time()),
+            conn = self._conn
+            if entry_id is not None:
+                row = conn.execute(
+                    "SELECT id, entity_id FROM trackers WHERE entry_id = ?", (entry_id,)
+                ).fetchone()
+                if row:
+                    tracker_id, current_entity_id = int(row[0]), row[1]
+                    if current_entity_id != entity_id:
+                        owner = conn.execute(
+                            "SELECT id FROM trackers WHERE entity_id = ?", (entity_id,)
+                        ).fetchone()
+                        if owner is not None:
+                            _LOGGER.warning(
+                                "Cannot move tracker %s to %s: entity id already"
+                                " owned by tracker %s; new points stay invisible"
+                                " until the conflict is resolved",
+                                tracker_id,
+                                entity_id,
+                                int(owner[0]),
+                            )
+                        else:
+                            conn.execute(
+                                "UPDATE trackers SET entity_id = ? WHERE id = ?",
+                                (entity_id, tracker_id),
+                            )
+                            conn.commit()
+                    return tracker_id
+                row = conn.execute(
+                    "SELECT id FROM trackers WHERE entity_id = ? AND entry_id IS NULL",
+                    (entity_id,),
+                ).fetchone()
+                if row:
+                    tracker_id = int(row[0])
+                    conn.execute(
+                        "UPDATE trackers SET entry_id = ? WHERE id = ?",
+                        (entry_id, tracker_id),
+                    )
+                    conn.commit()
+                    return tracker_id
+            else:
+                row = conn.execute(
+                    "SELECT id FROM trackers WHERE entity_id = ?", (entity_id,)
+                ).fetchone()
+                if row:
+                    return int(row[0])
+            try:
+                cursor = conn.execute(
+                    "INSERT INTO trackers (entity_id, created_at, entry_id) VALUES (?, ?, ?)",
+                    (entity_id, time.time(), entry_id),
+                )
+                conn.commit()
+            except sqlite3.IntegrityError as err:
+                _LOGGER.warning(
+                    "Could not create tracker for %s (entry %s): %s",
+                    entity_id,
+                    entry_id,
+                    err,
+                )
+                raise StoreError(
+                    f"Entity {entity_id} is already owned by another GPS Timeline tracker"
+                ) from err
+            return int(cursor.lastrowid)
+
+    async def async_set_subject(
+        self, entry_id: str, kind: str | None, name: str | None
+    ) -> None:
+        await asyncio.to_thread(self._set_subject, entry_id, kind, name)
+
+    def _set_subject(self, entry_id: str, kind: str | None, name: str | None) -> None:
+        with self._conn_lock:
+            if self._conn is None:
+                raise StoreError("Store is not set up")
+            if not kind or not name:
+                kind = None
+                name = None
+            self._conn.execute(
+                "UPDATE trackers SET subject_kind = ?, subject_name = ? WHERE entry_id = ?",
+                (kind, name, entry_id),
             )
             self._conn.commit()
-            return int(cursor.lastrowid)
+
+    async def async_rename_entity(self, old_entity_id: str, new_entity_id: str) -> None:
+        await asyncio.to_thread(
+            self._rename_entity, old_entity_id.lower(), new_entity_id.lower()
+        )
+
+    def _rename_entity(self, old_entity_id: str, new_entity_id: str) -> None:
+        with self._conn_lock:
+            if self._conn is None:
+                raise StoreError("Store is not set up")
+            conn = self._conn
+            row = conn.execute(
+                "SELECT id FROM trackers WHERE entity_id = ?", (old_entity_id,)
+            ).fetchone()
+            if row is not None:
+                owner = conn.execute(
+                    "SELECT id FROM trackers WHERE entity_id = ?", (new_entity_id,)
+                ).fetchone()
+                if owner is not None:
+                    _LOGGER.warning(
+                        "Cannot rename tracker entity %s to %s: new entity id is"
+                        " already owned by tracker %s; leaving history under %s",
+                        old_entity_id,
+                        new_entity_id,
+                        int(owner[0]),
+                        old_entity_id,
+                    )
+                    return
+                conn.execute(
+                    "UPDATE trackers SET entity_id = ? WHERE id = ?",
+                    (new_entity_id, int(row[0])),
+                )
+                conn.commit()
+                return
+            before = conn.total_changes
+            conn.execute(
+                "UPDATE OR IGNORE entity_states SET entity_id = ? WHERE entity_id = ?",
+                (new_entity_id, old_entity_id),
+            )
+            conn.commit()
+            moved = conn.total_changes - before
+            if moved:
+                _LOGGER.info(
+                    "Moved %s archived states from %s to %s",
+                    moved,
+                    old_entity_id,
+                    new_entity_id,
+                )
 
     async def async_query_states(
         self,

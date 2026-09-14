@@ -8,12 +8,35 @@
           "entity_id": "Tracker entity",
           "places_entity": "Places sensor (optional)",
           "activity_entity": "Activity sensor (optional)",
+          "subject_kind": "Subject kind (optional)",
+          "subject_name": "Subject name (optional)",
           "accuracy_threshold": "Maximum GPS accuracy (meters)"
         },
         "data_description": {
           "entity_id": "Any entity exposing latitude/longitude attributes, e.g. device_tracker.my_phone or person.alice.",
           "places_entity": "Places integration sensor whose labels are archived alongside the GPS points.",
           "activity_entity": "Sensor whose state describes the current activity, e.g. walking or driving.",
+          "subject_kind": "What this device tracks: person, topic, or object.",
+          "subject_name": "Name of the subject, e.g. Yacin or Car. Shown as an attribute on the tracker.",
+          "accuracy_threshold": "GPS fixes with an accuracy worse than this are ignored. Set to 0 to keep every fix."
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigure GPS Timeline",
+        "data": {
+          "entity_id": "Tracker entity",
+          "places_entity": "Places sensor (optional)",
+          "activity_entity": "Activity sensor (optional)",
+          "subject_kind": "Subject kind (optional)",
+          "subject_name": "Subject name (optional)",
+          "accuracy_threshold": "Maximum GPS accuracy (meters)"
+        },
+        "data_description": {
+          "entity_id": "Any entity exposing latitude/longitude attributes, e.g. device_tracker.my_phone or person.alice.",
+          "places_entity": "Places integration sensor whose labels are archived alongside the GPS points.",
+          "activity_entity": "Sensor whose state describes the current activity, e.g. walking or driving.",
+          "subject_kind": "What this device tracks: person, topic, or object.",
+          "subject_name": "Name of the subject, e.g. Yacin or Car. Shown as an attribute on the tracker.",
           "accuracy_threshold": "GPS fixes with an accuracy worse than this are ignored. Set to 0 to keep every fix."
         }
       }
@@ -32,11 +55,15 @@
         "data": {
           "places_entity": "Places sensor (optional)",
           "activity_entity": "Activity sensor (optional)",
+          "subject_kind": "Subject kind (optional)",
+          "subject_name": "Subject name (optional)",
           "accuracy_threshold": "Maximum GPS accuracy (meters)"
         },
         "data_description": {
           "places_entity": "Places integration sensor whose labels are archived alongside the GPS points.",
           "activity_entity": "Sensor whose state describes the current activity, e.g. walking or driving.",
+          "subject_kind": "What this device tracks: person, topic, or object.",
+          "subject_name": "Name of the subject, e.g. Yacin or Car. Shown as an attribute on the tracker.",
           "accuracy_threshold": "GPS fixes with an accuracy worse than this are ignored. Set to 0 to keep every fix."
         }
       }

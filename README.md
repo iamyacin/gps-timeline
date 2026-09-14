@@ -16,6 +16,8 @@ By default, Home Assistant's recorder keeps entity history for only 10 days (`pu
 - **Maximum fidelity** — every accepted fix is stored with all its attributes (accuracy, battery, speed, altitude, course, and anything else the source reports) as a full snapshot.
 - **Multiple users and devices** — add one configuration entry per tracked device; every entry can also archive its Places and activity sensors.
 - **Companion archive** — Places integration labels and activity sensor states are archived alongside the GPS points, so old timelines keep their place names even after the recorder purges them.
+- **Subjects** — optionally label what a device tracks (`person`, `topic` or `object`, plus a free-text name, e.g. "Yacin" or "Car"); the subject is exposed as attributes on the tracker entity.
+- **Rename-safe** — renaming or reconfiguring the tracked entity (or its companion sensors) in the entity registry keeps the full archived timeline; historical rows follow the new entity id and archiving continues without a gap.
 - **Backfill** — import up to 10 days of existing recorder history with one service call, so there is no gap when you start.
 - **Junk filtering** — fixes whose GPS accuracy is worse than a configurable threshold are skipped; coordinates are stored rounded to 6 decimals (~11 cm precision).
 - **Exposed entity** — each tracked device gets a `device_tracker.*` entity mirroring the latest archived point, usable anywhere in Home Assistant.
@@ -43,9 +45,17 @@ Copy `custom_components/gps_timeline` into the `custom_components` directory of 
 
 1. Go to **Settings → Devices & services → Add integration** and search for **GPS Timeline**.
 2. Pick the entity to track (one entry per device) and optionally select a **Places sensor** and an **activity sensor** to archive alongside it. Choose the main `sensor.places_*` entity: with Places v3, its `..._place_name` child sensor is resolved and archived automatically.
-3. Set the **maximum GPS accuracy** (default 100 m): fixes with worse accuracy are ignored. Set it to 0 to keep every fix.
+3. Optionally set a **subject**: what the device tracks (`person`, `topic` or `object`) and its name. Both fields are also available later from the entry's options; the subject appears as attributes on the exposed tracker entity.
+4. Set the **maximum GPS accuracy** (default 100 m): fixes with worse accuracy are ignored. Set it to 0 to keep every fix.
 
 Repeat for each additional person or device. Deleting an entry removes the listener and the exposed entity but **keeps the archived data**.
+
+### Renaming and reconfiguring
+
+- **Rename in the entity registry** (Settings → Devices & services → Entities → pencil): GPS Timeline follows the rename automatically — the archived history moves to the new entity id and live archiving keeps working. This applies to the tracked entity and to companion sensors, including the Places `..._place_name` child sensor.
+- **Reconfigure** (entry → ⋮ → Reconfigure): switch the tracked entity or companion sensors without deleting the entry; the archive and its history are preserved and moved to the new entity ids.
+
+Existing databases from earlier versions migrate transparently on upgrade — no data is lost and no action is needed.
 
 ## Use with the Location Timeline Card
 
@@ -90,7 +100,7 @@ data:
 ## Data and storage
 
 - Database location: `<config>/gps_timeline/gps_timeline.db` (WAL mode) — inside the configuration directory, so it is included in Home Assistant backups.
-- Three tables: `trackers` (registered entities), `points` (one row per accepted GPS fix, with a full attribute snapshot), `entity_states` (companion sensor states).
+- Three tables: `trackers` (registered entities, with their config entry and optional subject), `points` (one row per accepted GPS fix, with a full attribute snapshot), `entity_states` (companion sensor states).
 - Coordinates are rounded to 6 decimals (~11 cm) before storage; the same rounded values are served back.
 - Nothing is ever deleted automatically. Storage use is roughly 50–150 MB per year per actively moving device.
 - The integration never talks to the internet.

@@ -10,8 +10,8 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event
 
-from .const import CONF_ENTITY_ID, DOMAIN
-from .helpers import accuracy_threshold
+from .const import CONF_ENTITY_ID, CONF_SUBJECT_KIND, CONF_SUBJECT_NAME, DOMAIN
+from .helpers import accuracy_threshold, entry_setting
 from .store import normalize_point
 
 _SKIPPED_ATTRIBUTES = {
@@ -130,6 +130,11 @@ class GPSTimelineTrackerEntity(TrackerEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         attributes: dict[str, Any] = {"source_entity": self._source}
+        if (subject_kind := entry_setting(self._entry, CONF_SUBJECT_KIND)) and (
+            subject_name := entry_setting(self._entry, CONF_SUBJECT_NAME)
+        ):
+            attributes["subject_kind"] = subject_kind
+            attributes["subject_name"] = subject_name
         if self._point is None:
             return attributes
         if self._point.get("speed") is not None:

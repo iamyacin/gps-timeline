@@ -6,6 +6,8 @@ CONF_ENTITY_ID = "entity_id"
 CONF_PLACES_ENTITY = "places_entity"
 CONF_ACTIVITY_ENTITY = "activity_entity"
 CONF_ACCURACY_THRESHOLD = "accuracy_threshold"
+CONF_SUBJECT_KIND = "subject_kind"
+CONF_SUBJECT_NAME = "subject_name"
 
 DEFAULT_ACCURACY_THRESHOLD = 100
 COORD_DECIMALS = 6

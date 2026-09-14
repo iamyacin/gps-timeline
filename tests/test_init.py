@@ -1,4 +1,5 @@
 from pathlib import Path
+import sqlite3
 
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import (
@@ -311,3 +312,142 @@ async def test_options_reload_swaps_place_name_listener(hass):
     )
     assert result["sensor.places_work_place_name"][0]["s"] == "Work"
     assert "sensor.places_home_place_name" not in result
+
+
+def register_entity(hass, entity_id, platform="device_tracker", unique_id="phone"):
+    domain, object_id = entity_id.split(".", 1)
+    return er.async_get(hass).async_get_or_create(
+        domain, platform, unique_id, suggested_object_id=object_id
+    )
+
+
+def tracker_id_for(hass, entity_id):
+    db_path = Path(hass.config.path(DB_DIR_NAME, DB_FILE_NAME))
+    conn = sqlite3.connect(str(db_path))
+    row = conn.execute("SELECT id FROM trackers WHERE entity_id = ?", (entity_id,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+async def test_registry_rename_updates_store_and_entry_data(hass):
+    entry = await setup_entry(
+        hass, prepare=lambda entry: register_entity(hass, "device_tracker.phone")
+    )
+    hass.states.async_set("device_tracker.phone", "not_home", TRACKER_ATTRS)
+    await flush_store(hass)
+    old_tracker_id = tracker_id_for(hass, "device_tracker.phone")
+    assert old_tracker_id is not None
+
+    er.async_get(hass).async_update_entity(
+        "device_tracker.phone", new_entity_id="device_tracker.phone_new"
+    )
+    await hass.async_block_till_done()
+
+    assert entry.data[CONF_ENTITY_ID] == "device_tracker.phone_new"
+    assert tracker_id_for(hass, "device_tracker.phone_new") == old_tracker_id
+    assert tracker_id_for(hass, "device_tracker.phone") is None
+
+
+async def test_live_archiving_continues_after_registry_rename(hass):
+    await setup_entry(
+        hass, prepare=lambda entry: register_entity(hass, "device_tracker.phone")
+    )
+    hass.states.async_set("device_tracker.phone", "not_home", TRACKER_ATTRS)
+    await flush_store(hass)
+
+    er.async_get(hass).async_update_entity(
+        "device_tracker.phone", new_entity_id="device_tracker.phone_new"
+    )
+    await hass.async_block_till_done()
+
+    hass.states.async_set(
+        "device_tracker.phone_new",
+        "home",
+        {**TRACKER_ATTRS, "latitude": 52.0, "longitude": 10.0},
+    )
+    await flush_store(hass)
+
+    store = hass.data[DOMAIN]["store"]
+    now = dt_util.utcnow().timestamp()
+    result = await store.async_query_states(
+        ["device_tracker.phone_new"], now - 3600, now + 3600
+    )
+    assert len(result["device_tracker.phone_new"]) == 2
+    assert result["device_tracker.phone_new"][-1]["a"]["latitude"] == 52.0
+
+
+async def test_companion_rename_moves_rows_and_updates_entry(hass):
+    def prepare(entry):
+        register_entity(hass, "device_tracker.phone")
+        register_places_pair(hass, entry, "sensor.places_phone")
+
+    entry = await setup_entry(
+        hass,
+        places_entity="sensor.places_phone",
+        prepare=prepare,
+    )
+    hass.states.async_set("sensor.places_phone", "Starbucks", {"place_name": "Starbucks"})
+    hass.states.async_set(
+        "sensor.places_phone_place_name", "Starbucks", {"place_name": "Starbucks"}
+    )
+    await flush_store(hass)
+
+    er.async_get(hass).async_update_entity(
+        "sensor.places_phone", new_entity_id="sensor.places_phone_renamed"
+    )
+    await hass.async_block_till_done()
+
+    assert entry.data[CONF_PLACES_ENTITY] == "sensor.places_phone_renamed"
+    store = hass.data[DOMAIN]["store"]
+    now = dt_util.utcnow().timestamp()
+    result = await store.async_query_states(
+        ["sensor.places_phone_renamed"], now - 3600, now + 3600
+    )
+    assert result["sensor.places_phone_renamed"][0]["s"] == "Starbucks"
+    assert "sensor.places_phone" not in await store.async_query_states(
+        ["sensor.places_phone"], now - 3600, now + 3600
+    )
+
+    hass.states.async_set("sensor.places_phone_renamed", "Home", {})
+    await flush_store(hass)
+    result = await store.async_query_states(
+        ["sensor.places_phone_renamed"], now - 3600, now + 3600
+    )
+    assert result["sensor.places_phone_renamed"][-1]["s"] == "Home"
+
+
+async def test_subject_configured_and_exposed(hass):
+    await setup_entry(hass, subject_kind="person", subject_name="Yacin")
+    hass.states.async_set("device_tracker.phone", "not_home", TRACKER_ATTRS)
+    await flush_store(hass)
+
+    exposed = hass.states.get("device_tracker.gps_timeline_phone_timeline")
+    assert exposed is not None
+    assert exposed.attributes["subject_kind"] == "person"
+    assert exposed.attributes["subject_name"] == "Yacin"
+
+    conn = sqlite3.connect(str(Path(hass.config.path(DB_DIR_NAME, DB_FILE_NAME))))
+    row = conn.execute(
+        "SELECT subject_kind, subject_name FROM trackers WHERE entity_id = ?",
+        ("device_tracker.phone",),
+    ).fetchone()
+    conn.close()
+    assert row == ("person", "Yacin")
+
+
+async def test_unload_reload_keeps_history_under_same_tracker_id(hass):
+    entry = await setup_entry(hass)
+    hass.states.async_set("device_tracker.phone", "not_home", TRACKER_ATTRS)
+    await flush_store(hass)
+    old_tracker_id = tracker_id_for(hass, "device_tracker.phone")
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert tracker_id_for(hass, "device_tracker.phone") == old_tracker_id
+    store = hass.data[DOMAIN]["store"]
+    now = dt_util.utcnow().timestamp()
+    result = await store.async_query_states(["device_tracker.phone"], now - 3600, now + 3600)
+    assert len(result["device_tracker.phone"]) == 1
