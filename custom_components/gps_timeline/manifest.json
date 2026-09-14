@@ -9,5 +9,5 @@
   "issue_tracker": "https://github.com/iamyacin/gps-timeline/issues",
   "after_dependencies": ["recorder"],
   "requirements": [],
-  "version": "0.1.0-beta"
+  "version": "0.1.0-beta.2"
 }
