@@ -1,9 +1,7 @@
 from pathlib import Path
 import sqlite3
 
-from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import (
-    device_registry as dr,
     entity_registry as er,
     issue_registry as ir,
 )
@@ -19,7 +17,6 @@ from custom_components.gps_timeline.const import (
     DB_FILE_NAME,
     DOMAIN,
 )
-from custom_components.gps_timeline.helpers import tracked_entity_ids
 
 TRACKER_ATTRS = {
     "latitude": 50.1234567,
@@ -30,24 +27,6 @@ TRACKER_ATTRS = {
     "source_type": "gps",
     "friendly_name": "Phone",
 }
-
-
-def register_places_pair(hass, entry, base_entity_id):
-    """Register a Places v3 main sensor and its `_place_name` child on one device."""
-    device = dr.async_get(hass).async_get_or_create(
-        config_entry_id=entry.entry_id,
-        identifiers={("places", base_entity_id)},
-    )
-    registry = er.async_get(hass)
-    object_id = base_entity_id.split(".", 1)[1]
-    for entity_object_id in (object_id, f"{object_id}_place_name"):
-        registry.async_get_or_create(
-            "sensor",
-            "places",
-            entity_object_id,
-            suggested_object_id=entity_object_id,
-            device_id=device.id,
-        )
 
 
 async def setup_entry(hass, prepare=None, **overrides):
@@ -219,101 +198,6 @@ async def test_healthy_db_does_not_create_repair_issue(hass):
     assert (DOMAIN, "corrupt_database") not in registry.issues
 
 
-async def test_places_v3_place_name_child_archived(hass):
-    await setup_entry(
-        hass,
-        places_entity="sensor.places_phone",
-        prepare=lambda entry: register_places_pair(hass, entry, "sensor.places_phone"),
-    )
-    hass.states.async_set("sensor.places_phone", "Starbucks", {"place_name": "Starbucks"})
-    hass.states.async_set(
-        "sensor.places_phone_place_name", "Starbucks", {"place_name": "Starbucks"}
-    )
-    await flush_store(hass)
-
-    store = hass.data[DOMAIN]["store"]
-    now = dt_util.utcnow().timestamp()
-    result = await store.async_query_states(
-        ["sensor.places_phone", "sensor.places_phone_place_name"], now - 3600, now + 3600
-    )
-    assert result["sensor.places_phone"][0]["s"] == "Starbucks"
-    assert result["sensor.places_phone_place_name"][0]["s"] == "Starbucks"
-
-
-async def test_places_v2_sensor_without_child_archives_only_main(hass):
-    await setup_entry(hass, places_entity="sensor.places_phone")
-    hass.states.async_set("sensor.places_phone", "Starbucks", {"place_name": "Starbucks"})
-    await flush_store(hass)
-
-    store = hass.data[DOMAIN]["store"]
-    now = dt_util.utcnow().timestamp()
-    result = await store.async_query_states(
-        ["sensor.places_phone", "sensor.places_phone_place_name"], now - 3600, now + 3600
-    )
-    assert result["sensor.places_phone"][0]["s"] == "Starbucks"
-    assert "sensor.places_phone_place_name" not in result
-
-
-async def test_place_name_child_resolved_from_state_fallback(hass):
-    await setup_entry(
-        hass,
-        places_entity="sensor.places_phone",
-        prepare=lambda entry: hass.states.async_set(
-            "sensor.places_phone_place_name", "previous", {}
-        ),
-    )
-    hass.states.async_set("sensor.places_phone", "Starbucks", {})
-    hass.states.async_set("sensor.places_phone_place_name", "Starbucks", {})
-    await flush_store(hass)
-
-    store = hass.data[DOMAIN]["store"]
-    now = dt_util.utcnow().timestamp()
-    result = await store.async_query_states(
-        ["sensor.places_phone_place_name"], now - 3600, now + 3600
-    )
-    assert result["sensor.places_phone_place_name"][0]["s"] == "Starbucks"
-
-
-async def test_place_name_child_selected_directly_is_not_duplicated(hass):
-    entry = await setup_entry(
-        hass,
-        places_entity="sensor.places_phone_place_name",
-        prepare=lambda entry: register_places_pair(hass, entry, "sensor.places_phone"),
-    )
-    assert tracked_entity_ids(hass, entry) == [
-        "device_tracker.phone",
-        "sensor.places_phone_place_name",
-    ]
-
-
-async def test_options_reload_swaps_place_name_listener(hass):
-    entry = await setup_entry(hass, places_entity="sensor.places_home")
-
-    hass.states.async_set("sensor.places_work_place_name", "previous", {})
-    result = await hass.config_entries.options.async_init(entry.entry_id)
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"],
-        user_input={CONF_PLACES_ENTITY: "sensor.places_work", CONF_ACCURACY_THRESHOLD: 100},
-    )
-    await hass.async_block_till_done()
-    assert result["type"] == FlowResultType.CREATE_ENTRY
-    assert entry.options[CONF_PLACES_ENTITY] == "sensor.places_work"
-
-    hass.states.async_set("sensor.places_home_place_name", "Home", {})
-    hass.states.async_set("sensor.places_work_place_name", "Work", {})
-    await flush_store(hass)
-
-    store = hass.data[DOMAIN]["store"]
-    now = dt_util.utcnow().timestamp()
-    result = await store.async_query_states(
-        ["sensor.places_home_place_name", "sensor.places_work_place_name"],
-        now - 3600,
-        now + 3600,
-    )
-    assert result["sensor.places_work_place_name"][0]["s"] == "Work"
-    assert "sensor.places_home_place_name" not in result
-
-
 def register_entity(hass, entity_id, platform="device_tracker", unique_id="phone"):
     domain, object_id = entity_id.split(".", 1)
     return er.async_get(hass).async_get_or_create(
@@ -379,7 +263,9 @@ async def test_live_archiving_continues_after_registry_rename(hass):
 async def test_companion_rename_moves_rows_and_updates_entry(hass):
     def prepare(entry):
         register_entity(hass, "device_tracker.phone")
-        register_places_pair(hass, entry, "sensor.places_phone")
+        register_entity(
+            hass, "sensor.places_phone", platform="sensor", unique_id="places_phone"
+        )
 
     entry = await setup_entry(
         hass,
@@ -387,9 +273,6 @@ async def test_companion_rename_moves_rows_and_updates_entry(hass):
         prepare=prepare,
     )
     hass.states.async_set("sensor.places_phone", "Starbucks", {"place_name": "Starbucks"})
-    hass.states.async_set(
-        "sensor.places_phone_place_name", "Starbucks", {"place_name": "Starbucks"}
-    )
     await flush_store(hass)
 
     er.async_get(hass).async_update_entity(

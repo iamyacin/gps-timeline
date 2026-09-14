@@ -24,7 +24,6 @@ from .const import (
     DEFAULT_ACCURACY_THRESHOLD,
     DOMAIN,
 )
-from .helpers import PLACE_NAME_SUFFIX
 
 SOURCE_ENTITY_SELECTOR = EntitySelector()
 COMPANION_ENTITY_SELECTOR = EntitySelector()
@@ -106,18 +105,15 @@ def normalize_subject(user_input: dict[str, Any]) -> dict[str, Any]:
 
 def companion_moves(
     old_data: dict[str, Any], new_settings: dict[str, Any]
-) -> list[tuple[str, str, str | None]]:
-    """Diff old vs new companion entity ids into (old, new, child) store moves."""
-    moves: list[tuple[str, str, str | None]] = []
+) -> list[tuple[str, str]]:
+    """Diff old vs new companion entity ids into (old, new) store moves."""
+    moves: list[tuple[str, str]] = []
     for key in (CONF_PLACES_ENTITY, CONF_ACTIVITY_ENTITY):
         old_value = (old_data.get(key) or "").lower()
         new_value = (new_settings.get(key) or "").lower()
         if not old_value or not new_value or old_value == new_value:
             continue
-        child_old = None
-        if key == CONF_PLACES_ENTITY:
-            child_old = f"{old_value}{PLACE_NAME_SUFFIX}"
-        moves.append((old_value, new_value, child_old))
+        moves.append((old_value, new_value))
     return moves
 
 
@@ -170,12 +166,8 @@ class GPSTimelineConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 }
                 store = self.hass.data.get(DOMAIN, {}).get("store")
                 if store is not None:
-                    for old_id, new_id, child_old in companion_moves(entry.data, data):
+                    for old_id, new_id in companion_moves(entry.data, data):
                         await store.async_rename_entity(old_id, new_id)
-                        if child_old is not None:
-                            await store.async_rename_entity(
-                                child_old, f"{new_id}{PLACE_NAME_SUFFIX}"
-                            )
                 return self.async_update_reload_and_abort(entry, data=data)
         return self.async_show_form(
             step_id="reconfigure",
@@ -191,7 +183,7 @@ class GPSTimelineConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return OptionsFlowHandler()
 
 
-class OptionsFlowHandler(config_entries.OptionsFlowWithReload):
+class OptionsFlowHandler(config_entries.OptionsFlow):
     """Handle GPS Timeline options."""
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None):

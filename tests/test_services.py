@@ -101,48 +101,6 @@ async def test_backfill_imports_recorder_states(hass, monkeypatch):
     assert states[0]["s"] == "Starbucks"
 
 
-async def test_backfill_imports_place_name_child(hass, monkeypatch):
-    await setup_entry(hass)
-    hass.states.async_set("sensor.places_phone_place_name", "previous", {})
-    monkeypatch.setattr(services, "_recorder_instance", lambda hass: FakeRecorderInstance())
-
-    def fake_get_significant_states(
-        hass, start_time=None, end_time=None, entity_ids=None, **kwargs
-    ):
-        assert "sensor.places_phone_place_name" in entity_ids
-        return {
-            "device_tracker.phone": [
-                make_state(
-                    "device_tracker.phone",
-                    "home",
-                    dict(TRACKER_ATTRS, latitude=50.0, longitude=9.0),
-                    1000.0,
-                ),
-            ],
-            "sensor.places_phone_place_name": [
-                make_state(
-                    "sensor.places_phone_place_name",
-                    "Starbucks",
-                    {"place_name": "Starbucks"},
-                    1500.0,
-                ),
-            ],
-        }
-
-    monkeypatch.setattr(services, "get_significant_states", fake_get_significant_states)
-
-    await hass.services.async_call(
-        DOMAIN, SERVICE_BACKFILL, {CONF_ENTITY_ID: "device_tracker.phone"}, blocking=True
-    )
-
-    store = hass.data[DOMAIN]["store"]
-    end = dt_util.utcnow().timestamp() + 10000
-    result = await store.async_query_states(["sensor.places_phone_place_name"], 0, end)
-    states = result["sensor.places_phone_place_name"]
-    assert len(states) == 1
-    assert states[0]["s"] == "Starbucks"
-
-
 async def test_backfill_unknown_entity_errors(hass):
     await setup_entry(hass)
     with pytest.raises(HomeAssistantError):

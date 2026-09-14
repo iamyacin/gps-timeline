@@ -20,12 +20,7 @@ from .const import (
     DB_FILE_NAME,
     DOMAIN,
 )
-from .helpers import (
-    PLACE_NAME_SUFFIX,
-    accuracy_threshold,
-    entry_setting,
-    tracked_entity_ids,
-)
+from .helpers import accuracy_threshold, entry_setting, tracked_entity_ids
 from .services import async_register_services
 from .store import Store, normalize_entity_state, normalize_point
 from .websocket import async_register_websocket
@@ -85,7 +80,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     listeners = data.setdefault("listeners", {})
-    entity_ids = tracked_entity_ids(hass, entry)
+    entity_ids = tracked_entity_ids(entry)
 
     @callback
     def _handle_state_change(event: Event[EventStateChangedData]) -> None:
@@ -162,11 +157,6 @@ async def _async_chase_entity_rename(
     for key in (CONF_PLACES_ENTITY, CONF_ACTIVITY_ENTITY):
         if (entry.data.get(key) or "").lower() == old_entity_id:
             data_updates[key] = new_entity_id
-            if key == CONF_PLACES_ENTITY:
-                await store.async_rename_entity(
-                    f"{old_entity_id}{PLACE_NAME_SUFFIX}",
-                    f"{new_entity_id}{PLACE_NAME_SUFFIX}",
-                )
     if data_updates:
         hass.config_entries.async_update_entry(entry, data={**entry.data, **data_updates})
         hass.config_entries.async_schedule_reload(entry.entry_id)
