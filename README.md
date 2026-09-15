@@ -76,6 +76,15 @@ places_entity:
 
 You can point the card at either the original tracker entity or the exposed `device_tracker.*` entity — both work.
 
+### About the card fork
+
+The `history_source` option is **not** part of the official [timeline_card](https://github.com/konewka17/timeline_card). I opened a pull request upstream ([konewka17/timeline_card#108](https://github.com/konewka17/timeline_card/pull/108)) to add it as an opt-in, non-breaking option that unlocks unlimited history depth instead of the recorder's 10-day window, but the card owner declined it for now. So I maintain a fully tested fork of the card with the GPS Timeline support included:
+
+- **Fork (use this one):** [iamyacin/timeline_card](https://github.com/iamyacin/timeline_card)
+- **Upstream PR (declined):** [konewka17/timeline_card#108](https://github.com/konewka17/timeline_card/pull/108)
+
+To use GPS Timeline with the card, install the fork via HACS (add `iamyacin/timeline_card` as a custom repository with the category **Lovelace**) and configure it as shown above. The fork behaves identically to the upstream card — everything is opt-in and nothing changes unless `history_source: gps_timeline` is set.
+
 ## Services
 
 ### `gps_timeline.backfill`
@@ -92,6 +101,26 @@ Run it once after installing to backfill the recorder's existing window — afte
 
 ```yaml
 action: gps_timeline.backfill
+data:
+  entity_id: device_tracker.my_phone
+```
+
+### `gps_timeline.purge`
+
+Permanently deletes the archived location history of an entity — its points and companion states are removed from the SQLite database and this **cannot be undone**.
+
+| Field | Description |
+|---|---|
+| `entity_id` | The entity whose archived history should be deleted. |
+
+- If the entity belongs to a live tracker entry, its history is wiped and the entry is reloaded with an empty timeline; archiving then continues from scratch.
+- If the entity is no longer configured (orphaned archive data), only its archived rows are deleted.
+- The service fails with an error if there is no archived data for the entity or if the store is not running (no tracker is loaded).
+
+This is the manual counterpart of the confirmations in the UI: when you remove a tracker entry, a repair issue asks whether to also delete its archived data (kept by default), so the service is mainly useful for scripted cleanups in automations.
+
+```yaml
+action: gps_timeline.purge
 data:
   entity_id: device_tracker.my_phone
 ```
