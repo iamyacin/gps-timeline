@@ -8,6 +8,9 @@ CONF_ACTIVITY_ENTITY = "activity_entity"
 CONF_ACCURACY_THRESHOLD = "accuracy_threshold"
 CONF_SUBJECT_KIND = "subject_kind"
 CONF_SUBJECT_NAME = "subject_name"
+CONF_ATTACH_TRACKER_ID = "attach_tracker_id"
+
+ATTACH_START_FRESH = "start_fresh"
 
 DEFAULT_ACCURACY_THRESHOLD = 100
 COORD_DECIMALS = 6
@@ -23,3 +26,4 @@ MAX_RETRY_DELAY = 300.0
 WS_HISTORY_DURING_PERIOD = f"{DOMAIN}/history_during_period"
 
 SERVICE_BACKFILL = "backfill"
+SERVICE_PURGE = "purge"

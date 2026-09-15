@@ -14,12 +14,19 @@ import voluptuous as vol
 
 from .const import (
     CONF_ACCURACY_THRESHOLD,
+    CONF_ATTACH_TRACKER_ID,
     CONF_ENTITY_ID,
     DEFAULT_ACCURACY_THRESHOLD,
     DOMAIN,
     SERVICE_BACKFILL,
+    SERVICE_PURGE,
 )
-from .helpers import entry_setting, tracked_entity_ids
+from .helpers import (
+    async_purge_entry_data,
+    entry_setting,
+    live_entry_ids,
+    tracked_entity_ids,
+)
 from .store import Store, normalize_entity_state, normalize_point
 
 BACKFILL_SCHEMA = vol.Schema(
@@ -27,6 +34,12 @@ BACKFILL_SCHEMA = vol.Schema(
         vol.Required(CONF_ENTITY_ID): cv.entity_id,
         vol.Optional("start_time"): cv.datetime,
         vol.Optional("end_time"): cv.datetime,
+    }
+)
+
+PURGE_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_ENTITY_ID): cv.entity_id,
     }
 )
 
@@ -55,6 +68,9 @@ def _recorder_instance(hass: HomeAssistant):
 def async_register_services(hass: HomeAssistant) -> None:
     hass.services.async_register(
         DOMAIN, SERVICE_BACKFILL, _async_handle_backfill, schema=BACKFILL_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_PURGE, _async_handle_purge, schema=PURGE_SCHEMA
     )
 
 
@@ -114,3 +130,44 @@ async def _async_handle_backfill(call: ServiceCall) -> None:
         len(points),
         len(states),
     )
+
+
+async def _async_handle_purge(call: ServiceCall) -> None:
+    """Delete archived tracker data for an entity (destructive)."""
+    hass = call.hass
+    entity_id = call.data[CONF_ENTITY_ID].lower()
+
+    data = hass.data.get(DOMAIN)
+    store: Store | None = data.get("store") if isinstance(data, dict) else None
+    if store is None:
+        raise HomeAssistantError(
+            "GPS Timeline store is not available; it only runs while at least"
+            " one tracker is loaded"
+        )
+
+    tracker = await store.async_get_tracker_by_entity(entity_id)
+    if tracker is None:
+        raise HomeAssistantError(f"No archived GPS Timeline data for {entity_id}")
+
+    owner_entry_id = tracker.get("entry_id")
+    if owner_entry_id in set(live_entry_ids(hass)):
+        # Purging a live tracker wipes its history; drop the stale adoption
+        # provenance (its data no longer exists) and reload so archiving
+        # continues with a fresh, empty timeline.
+        entry = hass.config_entries.async_get_entry(owner_entry_id)
+        if entry is not None and CONF_ATTACH_TRACKER_ID in entry.data:
+            hass.config_entries.async_update_entry(
+                entry,
+                data={
+                    key: value
+                    for key, value in entry.data.items()
+                    if key != CONF_ATTACH_TRACKER_ID
+                },
+            )
+        await async_purge_entry_data(
+            hass, entry_id=owner_entry_id, exclude_entry_id=owner_entry_id
+        )
+        hass.config_entries.async_schedule_reload(owner_entry_id)
+        return
+
+    await async_purge_entry_data(hass, tracker_id=int(tracker["tracker_id"]))

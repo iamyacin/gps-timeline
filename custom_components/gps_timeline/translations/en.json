@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Add a tracked device",
-        "description": "GPS Timeline archives the location history of one entity so it is never purged.",
+        "description": "GPS Timeline archives the location history of one entity in a dedicated database. Archived data is only deleted when you confirm it.",
         "data": {
           "entity_id": "Tracker entity",
           "places_entity": "Places sensor (optional)",
@@ -19,6 +19,16 @@
           "subject_kind": "What this device tracks: person, topic, or object.",
           "subject_name": "Name of the subject, e.g. Yacin or Car. Shown as an attribute on the tracker.",
           "accuracy_threshold": "GPS fixes with an accuracy worse than this are ignored. Set to 0 to keep every fix."
+        }
+      },
+      "attach": {
+        "title": "Archived data found",
+        "description": "Archived location history without a tracker exists in the GPS Timeline database. Attach it to this new tracker to continue the old timeline, or start fresh.",
+        "data": {
+          "attach_tracker_id": "Archived history to attach"
+        },
+        "data_description": {
+          "attach_tracker_id": "Attaching continues the archived timeline under this tracker. Start fresh leaves the archive untouched — it stays in the database and can be attached later (or deleted via the repair flow). If the selected entity already has archived data, start fresh is not possible."
         }
       },
       "reconfigure": {
@@ -42,7 +52,9 @@
       }
     },
     "error": {
-      "missing_coordinates": "The selected entity does not expose latitude/longitude attributes."
+      "missing_coordinates": "The selected entity does not expose latitude/longitude attributes.",
+      "orphan_unavailable": "That archived data is no longer available — it may have been deleted meanwhile. Pick another entry or start fresh.",
+      "adopt_conflict": "The selected entity already has archived data owned by another tracker; both rows were left untouched. Delete or re-home the other tracker first."
     },
     "abort": {
       "already_configured": "This entity is already tracked by GPS Timeline."
@@ -73,6 +85,27 @@
     "corrupt_database": {
       "title": "GPS Timeline database was corrupted",
       "description": "The GPS Timeline database could not be opened. The corrupt file was moved to `{backup_path}` and a new empty database was created. Location history archived before this point is only available in the backup file."
+    },
+    "stale_timeline_data": {
+      "title": "Archived GPS Timeline data for {entity_id}",
+      "description": "The GPS Timeline tracker for `{entity_id}` was removed, but its archived location history and companion states are still stored in the database and are not displayed anywhere. Use the confirm button to decide whether to delete the data permanently or keep it. Keeping it is safe: the archive stays in the database and can be attached again when the subject is added to GPS Timeline again.",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "Delete archived history for {entity_id}?",
+            "description": "This permanently deletes all archived locations and companion states for `{entity_id}` from the GPS Timeline database. Keeping the data is the safe default: it stays in the database and becomes selectable again when the subject is added to GPS Timeline. This action cannot be undone.",
+            "data": {
+              "delete_data": "Delete the archived data permanently"
+            },
+            "data_description": {
+              "delete_data": "Leave this off to keep the archived data (recommended)."
+            },
+            "error": {
+              "purge_failed": "The database could not be written (it may be locked by another process). Nothing was deleted; try again."
+            }
+          }
+        }
+      }
     }
   },
   "services": {
@@ -91,6 +124,16 @@
         "end_time": {
           "name": "End time",
           "description": "Latest point to import. Defaults to now."
+        }
+      }
+    },
+    "purge": {
+      "name": "Delete archived data",
+      "description": "Permanently deletes the archived location history (points and companion states) for an entity. This cannot be undone.",
+      "fields": {
+        "entity_id": {
+          "name": "Tracker entity",
+          "description": "The entity whose archived history should be deleted. Deleting a live tracker's history reloads it with an empty timeline."
         }
       }
     }

@@ -1,12 +1,21 @@
+from pathlib import Path
+import sqlite3
+
 from homeassistant.config_entries import SOURCE_RECONFIGURE, SOURCE_USER
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import config_validation as cv
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.gps_timeline.const import (
+    ATTACH_START_FRESH,
     CONF_ACCURACY_THRESHOLD,
     CONF_ACTIVITY_ENTITY,
+    CONF_ATTACH_TRACKER_ID,
     CONF_ENTITY_ID,
     CONF_PLACES_ENTITY,
+    DB_DIR_NAME,
+    DB_FILE_NAME,
     DOMAIN,
 )
 
@@ -32,6 +41,35 @@ TRACKER_ATTRS_TABLET = {
 
 async def _set_tracker_state(hass):
     hass.states.async_set("device_tracker.phone", "home", TRACKER_ATTRS)
+
+
+def _marker_for(schema, key):
+    for marker in schema.schema:
+        if marker == key:
+            return marker
+    return None
+
+
+async def _make_orphan(hass, entity_id):
+    """Archive data for an entity, then remove the entry to orphan the row."""
+    hass.states.async_set(entity_id, "not_home", TRACKER_ATTRS)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_ENTITY_ID: entity_id,
+            CONF_PLACES_ENTITY: None,
+            CONF_ACTIVITY_ENTITY: None,
+            CONF_ACCURACY_THRESHOLD: 100,
+        },
+        title="GPS Timeline",
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    hass.states.async_set(entity_id, "home", TRACKER_ATTRS)
+    await hass.data[DOMAIN]["store"].async_flush()
+    await hass.config_entries.async_remove(entry.entry_id)
+    await hass.async_block_till_done()
 
 
 async def test_user_flow_creates_entry(hass):
@@ -343,3 +381,126 @@ async def test_reconfigure_flow_cleared_companion_keeps_old_rows(hass):
     store = hass.data[DOMAIN]["store"]
     result = await store.async_query_states(["sensor.places_phone"], 0, 1000)
     assert len(result["sensor.places_phone"]) == 1
+
+
+async def _start_user_flow(hass, entity_id="device_tracker.phone"):
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
+    return await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"entity_id": entity_id, CONF_ACCURACY_THRESHOLD: 100}
+    )
+
+
+def _chooser_options(result):
+    marker = _marker_for(result["data_schema"], CONF_ATTACH_TRACKER_ID)
+    assert marker is not None
+    selector = result["data_schema"].schema[marker]
+    options = selector.config["options"]
+    values = [option if isinstance(option, str) else option["value"] for option in options]
+    default = marker.default() if callable(marker.default) else marker.default
+    return values, default
+
+
+async def test_orphans_show_attach_step_with_preselected_match(hass):
+    await _make_orphan(hass, "device_tracker.phone")
+    result = await _start_user_flow(hass)
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "attach"
+    values, default = _chooser_options(result)
+    assert ATTACH_START_FRESH in values
+    assert default != ATTACH_START_FRESH
+    orphan_choice = str(default)
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_ATTACH_TRACKER_ID: orphan_choice}
+    )
+    await hass.async_block_till_done()
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+
+    entries = hass.config_entries.async_entries(DOMAIN)
+    assert len(entries) == 1
+    assert entries[0].data[CONF_ATTACH_TRACKER_ID] == int(orphan_choice)
+    assert entries[0].data[CONF_ENTITY_ID] == "device_tracker.phone"
+
+
+async def test_attach_start_fresh_keeps_orphan(hass):
+    await _make_orphan(hass, "device_tracker.phone")
+    result = await _start_user_flow(hass)
+    assert result["step_id"] == "attach"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_ATTACH_TRACKER_ID: ATTACH_START_FRESH}
+    )
+    await hass.async_block_till_done()
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+
+    entries = hass.config_entries.async_entries(DOMAIN)
+    assert entries[0].data[CONF_ATTACH_TRACKER_ID] is None
+
+    conn = sqlite3.connect(str(Path(hass.config.path(DB_DIR_NAME, DB_FILE_NAME))))
+    assert conn.execute("SELECT COUNT(*) FROM points").fetchone()[0] == 1
+    conn.close()
+
+
+async def test_attach_adopt_continues_history(hass):
+    await _make_orphan(hass, "device_tracker.phone")
+    result = await _start_user_flow(hass)
+    _values, default = _chooser_options(result)
+    orphan_choice = str(default)
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_ATTACH_TRACKER_ID: orphan_choice}
+    )
+    await hass.async_block_till_done()
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+
+    store = hass.data[DOMAIN]["store"]
+    end = dt_util.utcnow().timestamp() + 3600
+    history = await store.async_query_states(["device_tracker.phone"], 0, end)
+    assert len(history["device_tracker.phone"]) == 1
+
+
+async def test_attach_stale_orphan_shows_error(hass):
+    await _make_orphan(hass, "device_tracker.phone")
+    result = await _start_user_flow(hass)
+    assert result["step_id"] == "attach"
+    values, default = _chooser_options(result)
+    orphan_choice = str(default)
+    assert orphan_choice in values
+
+    db_path = str(Path(hass.config.path(DB_DIR_NAME, DB_FILE_NAME)))
+    from custom_components.gps_timeline.store import async_purge_tracker_standalone
+
+    counts = await async_purge_tracker_standalone(hass, db_path, tracker_id=int(orphan_choice))
+    assert counts["trackers"] == 1
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_ATTACH_TRACKER_ID: orphan_choice}
+    )
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"base": "orphan_unavailable"}
+
+
+async def test_attach_conflict_rejected(hass):
+    await _make_orphan(hass, "device_tracker.phone")
+    await _make_orphan(hass, "device_tracker.old")
+
+    result = await _start_user_flow(hass)
+    assert result["step_id"] == "attach"
+    values, default = _chooser_options(result)
+    assert len(values) == 3
+
+    other = next(value for value in values if value not in (str(default), ATTACH_START_FRESH))
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_ATTACH_TRACKER_ID: other}
+    )
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"base": "adopt_conflict"}
+
+
+async def test_no_orphans_skips_attach_step(hass):
+    await _set_tracker_state(hass)
+    result = await _start_user_flow(hass)
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert CONF_ATTACH_TRACKER_ID not in result.get("data", {})

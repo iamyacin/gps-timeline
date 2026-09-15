@@ -9,6 +9,8 @@ import pytest
 from custom_components.gps_timeline.store import (
     Store,
     StoreError,
+    async_list_orphans_standalone,
+    async_purge_tracker_standalone,
     normalize_entity_state,
     normalize_point,
 )
@@ -779,3 +781,352 @@ async def test_set_subject_set_update_clear(store):
 async def test_set_subject_with_no_matching_row_is_noop(store):
     await store.async_set_subject("missing", "person", "Nobody")
     assert await store.async_get_tracked_entity_ids() == []
+
+
+def make_point_row(ts, state="not_home"):
+    return normalize_point(make_state(state, TRACKER_ATTRS, ts=ts))
+
+
+def tracker_rows(store):
+    conn = sqlite3.connect(str(store._path))
+    rows = {
+        row[0]: row[1:]
+        for row in conn.execute("SELECT id, entity_id, entry_id FROM trackers ORDER BY id")
+    }
+    conn.close()
+    return rows
+
+
+def insert_tracker(store, entity_id, entry_id=None, kind=None, name=None):
+    """Insert a tracker row directly, mimicking an orphaned row."""
+    conn = sqlite3.connect(str(store._path))
+    cursor = conn.execute(
+        "INSERT INTO trackers (entity_id, created_at, entry_id, subject_kind, subject_name)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (entity_id, 1234.0, entry_id, kind, name),
+    )
+    tracker_id = int(cursor.lastrowid)
+    conn.commit()
+    conn.close()
+    return tracker_id
+
+
+async def test_purge_tracker_by_entry_id_cascades(store):
+    entry_tracker = await store.async_bind_tracker("entry-1", "device_tracker.phone")
+    store.async_add_points(entry_tracker, [make_point_row(ts) for ts in (100.0, 200.0)])
+    store.async_add_entity_state(
+        entry_tracker, "sensor.places_phone", (150.0, "Home", json.dumps({}))
+    )
+    other_tracker = await store.async_bind_tracker(None, "device_tracker.other")
+    store.async_add_point(other_tracker, make_point_row(ts=300.0))
+    await store.async_flush()
+
+    counts = await store.async_purge_tracker("entry-1")
+    assert counts == {"trackers": 1, "points": 2, "entity_states": 1}
+
+    rows = tracker_rows(store)
+    assert set(rows) == {2}
+    assert rows[2] == ("device_tracker.other", None)
+    result = await store.async_query_states(
+        ["device_tracker.phone", "sensor.places_phone", "device_tracker.other"], 0, 1000
+    )
+    assert list(result) == ["device_tracker.other"]
+    assert [item["lu"] for item in result["device_tracker.other"]] == [300.0]
+
+
+async def test_purge_unknown_entry_returns_zero_counts(store):
+    counts = await store.async_purge_tracker("missing-entry")
+    assert counts == {"trackers": 0, "points": 0, "entity_states": 0}
+
+
+async def test_purge_requires_exactly_one_key(store):
+    with pytest.raises(ValueError):
+        await store.async_purge_tracker()
+    with pytest.raises(ValueError):
+        await store.async_purge_tracker("entry-1", tracker_id=1)
+
+
+async def test_purge_tracker_by_id_rejects_live_bound_row(store):
+    tracker_id = await store.async_bind_tracker("entry-1", "device_tracker.phone")
+    with pytest.raises(StoreError, match="claimed by a live"):
+        await store.async_purge_tracker(
+            tracker_id=tracker_id,
+            live_entity_claims={"device_tracker.phone": "entry-1"},
+        )
+    assert tracker_rows(store)[tracker_id] == ("device_tracker.phone", "entry-1")
+
+
+async def test_purge_tracker_by_id_purges_orphan(store):
+    orphan_id = await store.async_bind_tracker(None, "device_tracker.phone")
+    counts = await store.async_purge_tracker(tracker_id=orphan_id)
+    assert counts == {"trackers": 1, "points": 0, "entity_states": 0}
+    assert await store.async_get_tracked_entity_ids() == []
+
+
+async def test_purge_shared_companion_entity_restamps_survivor(store):
+    """Companion history shared with a live entry survives purging."""
+    survivor_id = await store.async_bind_tracker("entry-live", "device_tracker.phone")
+    removed_id = await store.async_bind_tracker("entry-removed", "device_tracker.old")
+    store.async_add_entity_state(
+        removed_id, "sensor.places_phone", (100.0, "Home", json.dumps({}))
+    )
+    store.async_add_entity_state(
+        removed_id, "sensor.places_phone", (200.0, "Work", json.dumps({}))
+    )
+    store.async_add_points(removed_id, [make_point_row(100.0), make_point_row(200.0)])
+    await store.async_flush()
+
+    counts = await store.async_purge_tracker(
+        "entry-removed",
+        live_entity_claims={
+            "device_tracker.phone": "entry-live",
+            "sensor.places_phone": "entry-live",
+        },
+    )
+
+    assert counts == {"trackers": 1, "points": 2, "entity_states": 0}
+    conn = sqlite3.connect(str(store._path))
+    rows = conn.execute(
+        "SELECT tracker_id, ts, state FROM entity_states ORDER BY ts"
+    ).fetchall()
+    conn.close()
+    assert [(row[0], row[1], row[2]) for row in rows] == [
+        (survivor_id, 100.0, "Home"),
+        (survivor_id, 200.0, "Work"),
+    ]
+    result = await store.async_query_states(["sensor.places_phone"], 0, 1000)
+    assert [item["s"] for item in result["sensor.places_phone"]] == ["Home", "Work"]
+    assert await store.async_query_states(["device_tracker.old"], 0, 1000) == {}
+
+
+async def test_purge_drops_pending_queued_rows(store):
+    tracker_id = await store.async_bind_tracker("entry-1", "device_tracker.phone")
+    store.async_add_point(tracker_id, make_point_row(ts=100.0))
+    assert len(store._pending_points) == 1
+
+    counts = await store.async_purge_tracker("entry-1")
+    assert counts == {"trackers": 1, "points": 0, "entity_states": 0}
+    assert not store._pending_points
+
+    await store.async_flush()
+    result = await store.async_query_states(["device_tracker.phone"], 0, 1000)
+    assert result == {}
+
+
+async def test_purge_reused_tracker_id_not_filtered(store):
+    """A later tracker reusing a purged id must not be silently dropped."""
+    first = await store.async_bind_tracker("entry-1", "device_tracker.phone")
+    await store.async_purge_tracker("entry-1")
+    second = await store.async_bind_tracker("entry-2", "device_tracker.phone")
+    assert second == first
+
+    store.async_add_point(second, make_point_row(ts=100.0))
+    await store.async_flush()
+    result = await store.async_query_states(["device_tracker.phone"], 0, 1000)
+    assert len(result["device_tracker.phone"]) == 1
+
+
+async def test_purge_after_store_closed_standalone(tmp_path):
+    db_path = str(tmp_path / "gps_timeline" / "gps_timeline.db")
+    store = Store(FakeHass(), db_path)
+    await store.async_setup()
+    tracker_id = await store.async_bind_tracker("entry-1", "device_tracker.phone")
+    store.async_add_point(tracker_id, make_point_row(ts=100.0))
+    store.async_add_entity_state(
+        tracker_id, "sensor.places_phone", (100.0, "Home", json.dumps({}))
+    )
+    await store.async_flush()
+    await store.async_close()
+
+    counts = await async_purge_tracker_standalone(FakeHass(), db_path, "entry-1")
+    assert counts == {"trackers": 1, "points": 1, "entity_states": 1}
+
+    reopened = Store(FakeHass(), db_path)
+    await reopened.async_setup()
+    try:
+        assert await reopened.async_get_tracked_entity_ids() == []
+    finally:
+        await reopened.async_close()
+
+
+async def test_list_orphans_returns_metadata(store):
+    await store.async_bind_tracker("entry-live", "device_tracker.phone")
+    removed = insert_tracker(store, "device_tracker.orph", "entry-removed", "person", "Yacin")
+    legacy = insert_tracker(store, "device_tracker.legacy")
+    store.async_add_points(removed, [make_point_row(100.0), make_point_row(200.0)])
+    await store.async_flush()
+
+    orphans = await store.async_list_orphans(["entry-live"], ["device_tracker.phone"])
+    by_id = {orphan["tracker_id"]: orphan for orphan in orphans}
+    assert set(by_id) == {removed, legacy}
+    assert by_id[removed] == {
+        "tracker_id": removed,
+        "entity_id": "device_tracker.orph",
+        "subject_kind": "person",
+        "subject_name": "Yacin",
+        "created_at": 1234.0,
+        "entry_id": "entry-removed",
+        "point_count": 2,
+        "last_ts": 200.0,
+    }
+    assert by_id[legacy]["point_count"] == 0
+    assert by_id[legacy]["last_ts"] is None
+    assert by_id[legacy]["subject_kind"] is None
+
+
+async def test_list_orphans_with_no_live_entries(store):
+    await store.async_bind_tracker("entry-1", "device_tracker.phone")
+    orphans = await store.async_list_orphans([], [])
+    assert [orphan["entity_id"] for orphan in orphans] == ["device_tracker.phone"]
+
+
+async def test_list_orphans_standalone(tmp_path):
+    db_path = str(tmp_path / "gps_timeline" / "gps_timeline.db")
+    store = Store(FakeHass(), db_path)
+    await store.async_setup()
+    tracker_id = await store.async_bind_tracker("entry-1", "device_tracker.phone")
+    await store.async_close()
+
+    orphans = await async_list_orphans_standalone(FakeHass(), db_path, ["entry-live"], [])
+    assert [orphan["tracker_id"] for orphan in orphans] == [tracker_id]
+
+    reopened = Store(FakeHass(), db_path)
+    await reopened.async_setup()
+    try:
+        new_id = await reopened.async_bind_tracker("entry-2", "device_tracker.other")
+        assert new_id != tracker_id
+        orphans = await reopened.async_list_orphans(["entry-2"], ["device_tracker.other"])
+        assert [orphan["tracker_id"] for orphan in orphans] == [tracker_id]
+    finally:
+        await reopened.async_close()
+
+
+async def test_adopt_orphan_stamps_row(store):
+    orphan_id = insert_tracker(
+        store, "device_tracker.orph", "entry-removed", "person", "Yacin"
+    )
+
+    adopted = await store.async_adopt_orphan(
+        orphan_id, "entry-new", "device_tracker.phone_new", ("object", "Car")
+    )
+    assert adopted == orphan_id
+
+    rows = tracker_rows(store)
+    assert rows[orphan_id] == ("device_tracker.phone_new", "entry-new")
+    conn = sqlite3.connect(str(store._path))
+    assert conn.execute(
+        "SELECT subject_kind, subject_name FROM trackers WHERE id = ?", (orphan_id,)
+    ).fetchone() == ("object", "Car")
+    conn.close()
+
+    assert await store.async_list_orphans(["entry-new"], ["device_tracker.phone_new"]) == []
+
+
+async def test_adopt_orphan_clears_subject_without_new_subject(store):
+    orphan_id = insert_tracker(
+        store, "device_tracker.orph", "entry-removed", "person", "Yacin"
+    )
+
+    await store.async_adopt_orphan(orphan_id, "entry-new", "device_tracker.phone_new")
+
+    conn = sqlite3.connect(str(store._path))
+    assert conn.execute(
+        "SELECT subject_kind, subject_name FROM trackers WHERE id = ?", (orphan_id,)
+    ).fetchone() == (None, None)
+    conn.close()
+
+
+async def test_adopt_missing_orphan_errors(store):
+    with pytest.raises(StoreError, match="no longer exists"):
+        await store.async_adopt_orphan(1234, "entry-new", "device_tracker.phone")
+
+
+async def test_adopt_already_bound_orphan_rejected(store):
+    live_id = await store.async_bind_tracker("entry-live", "device_tracker.phone")
+    with pytest.raises(StoreError, match="already claimed"):
+        await store.async_adopt_orphan(
+            live_id, "entry-new", "device_tracker.other", live_entry_ids=["entry-live"]
+        )
+
+
+async def test_adopt_orphan_with_entity_conflict_rejected(store):
+    orphan_id = insert_tracker(store, "device_tracker.orph", "entry-removed")
+    await store.async_bind_tracker("entry-live", "device_tracker.phone")
+
+    with pytest.raises(StoreError, match="already owned by another"):
+        await store.async_adopt_orphan(
+            orphan_id, "entry-live2", "device_tracker.phone", live_entry_ids=["entry-live"]
+        )
+
+    rows = tracker_rows(store)
+    assert rows[orphan_id] == ("device_tracker.orph", "entry-removed")
+    assert rows[2] == ("device_tracker.phone", "entry-live")
+
+
+async def test_bind_tracker_with_adopt_binds_orphan(store):
+    """Adopting binds the chosen orphan row directly."""
+    orphan_id = insert_tracker(store, "device_tracker.orph", "entry-removed")
+
+    adopted = await store.async_bind_tracker(
+        "entry-1", "device_tracker.phone_new", adopt_tracker_id=orphan_id
+    )
+    assert adopted == orphan_id
+    assert tracker_rows(store)[orphan_id] == ("device_tracker.phone_new", "entry-1")
+
+
+async def test_bind_tracker_with_adopt_idempotent_on_reload(store):
+    orphan_id = insert_tracker(store, "device_tracker.orph", "entry-removed")
+
+    first = await store.async_bind_tracker(
+        "entry-1", "device_tracker.orph", adopt_tracker_id=orphan_id
+    )
+    second = await store.async_bind_tracker(
+        "entry-1", "device_tracker.phone_new", adopt_tracker_id=orphan_id
+    )
+    assert first == second == orphan_id
+    assert tracker_rows(store)[orphan_id] == ("device_tracker.phone_new", "entry-1")
+
+
+async def test_bind_tracker_with_adopt_purged_row_errors(store):
+    with pytest.raises(StoreError, match="no longer exists"):
+        await store.async_bind_tracker("entry-1", "device_tracker.phone", adopt_tracker_id=99)
+    assert await store.async_get_tracked_entity_ids() == []
+
+
+async def test_bind_tracker_with_adopt_entity_conflict_errors(store):
+    """Adoption skips the legacy entity-id auto-match: the collision raises instead."""
+    orphan_id = insert_tracker(store, "device_tracker.orph", "entry-removed")
+    legacy_id = await store.async_bind_tracker(None, "device_tracker.phone")
+
+    with pytest.raises(StoreError, match="already owned by another"):
+        await store.async_bind_tracker(
+            "entry-1", "device_tracker.phone", adopt_tracker_id=orphan_id
+        )
+
+    rows = tracker_rows(store)
+    assert rows[orphan_id] == ("device_tracker.orph", "entry-removed")
+    assert rows[legacy_id] == ("device_tracker.phone", None)
+
+
+async def test_bind_tracker_still_auto_matches_legacy_rows(store):
+    """Pre-v2 rows keep the one-time entity-id auto-match backfill."""
+    legacy_id = insert_tracker(store, "device_tracker.phone")
+    assert await store.async_bind_tracker("entry-1", "device_tracker.phone") == legacy_id
+    assert tracker_rows(store)[legacy_id] == ("device_tracker.phone", "entry-1")
+
+
+async def test_bind_tracker_post_v2_orphans_not_auto_matched(store):
+    """Post-v2 orphans (entry_id set) are never silently adopted."""
+    insert_tracker(store, "device_tracker.phone", "entry-removed")
+    with pytest.raises(StoreError, match="owned by another"):
+        await store.async_bind_tracker("entry-1", "device_tracker.phone")
+
+
+async def test_purge_lock_error_surfaces_as_store_error(store, monkeypatch):
+    def locked_purge(entry_id, tracker_id, live_entity_claims):
+        raise sqlite3.OperationalError("database is locked")
+
+    await store.async_bind_tracker("entry-1", "device_tracker.phone")
+    monkeypatch.setattr(store, "_purge_tracker", locked_purge)
+    with pytest.raises(StoreError, match="Could not purge"):
+        await store.async_purge_tracker("entry-1")

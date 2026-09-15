@@ -28,3 +28,21 @@ backfill:
       required: false
       selector:
         datetime:
+purge:
+  name: Delete archived data
+  description: >-
+    Permanently deletes the archived location history (points and companion
+    states) for an entity. This cannot be undone. Deleting a live tracker's
+    history reloads it with an empty timeline.
+  fields:
+    entity_id:
+      name: Tracker entity
+      description: The entity whose archived history should be deleted.
+      required: true
+      selector:
+        entity:
+          filter:
+            - domain: device_tracker
+            - domain: person
+            - domain: sensor
+            - domain: geo_location

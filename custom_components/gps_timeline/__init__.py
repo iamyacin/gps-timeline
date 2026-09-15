@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 
 from homeassistant.config_entries import ConfigEntry
@@ -12,6 +13,7 @@ from homeassistant.helpers.issue_registry import IssueSeverity
 
 from .const import (
     CONF_ACTIVITY_ENTITY,
+    CONF_ATTACH_TRACKER_ID,
     CONF_ENTITY_ID,
     CONF_PLACES_ENTITY,
     CONF_SUBJECT_KIND,
@@ -20,14 +22,20 @@ from .const import (
     DB_FILE_NAME,
     DOMAIN,
 )
-from .helpers import accuracy_threshold, entry_setting, tracked_entity_ids
+from .helpers import (
+    accuracy_threshold,
+    entry_setting,
+    live_entry_ids,
+    tracked_entity_ids,
+)
 from .services import async_register_services
-from .store import Store, normalize_entity_state, normalize_point
+from .store import Store, StoreError, normalize_entity_state, normalize_point
 from .websocket import async_register_websocket
 
 PLATFORMS = ["device_tracker"]
 
 _CORRUPT_DB_ISSUE_ID = "corrupt_database"
+_STALE_DATA_ISSUE_PREFIX = "stale_timeline_data_"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -72,12 +80,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         data["services_registered"] = True
 
     source_entity_id = entry.data[CONF_ENTITY_ID].lower()
-    tracker_id = await store.async_bind_tracker(entry.entry_id, source_entity_id)
+    adopt_tracker_id = entry.data.get(CONF_ATTACH_TRACKER_ID)
+    pre_adopt_entry_id: str | None = None
+    if adopt_tracker_id is not None:
+        pre_adopt = await store.async_get_tracker(int(adopt_tracker_id))
+        if pre_adopt is not None:
+            pre_adopt_entry_id = pre_adopt.get("entry_id")
+    tracker_id = await store.async_bind_tracker(
+        entry.entry_id,
+        source_entity_id,
+        adopt_tracker_id=adopt_tracker_id,
+        live_entry_ids=live_entry_ids(hass),
+    )
     await store.async_set_subject(
         entry.entry_id,
         entry_setting(entry, CONF_SUBJECT_KIND),
         entry_setting(entry, CONF_SUBJECT_NAME),
     )
+    if adopt_tracker_id is not None:
+        _clear_stale_data_issues(hass, int(adopt_tracker_id), pre_adopt_entry_id)
 
     listeners = data.setdefault("listeners", {})
     entity_ids = tracked_entity_ids(entry)
@@ -183,3 +204,60 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.debug("Last entry unloaded; store closed")
 
     return unload_ok
+
+
+def _stale_data_issue_id(entry_id: str) -> str:
+    return f"{_STALE_DATA_ISSUE_PREFIX}{entry_id}"
+
+
+def _clear_stale_data_issues(
+    hass: HomeAssistant, tracker_id: int, old_entry_id: str | None
+) -> None:
+    """Delete the repair issue whose archived data was just re-claimed."""
+    registry = ir.async_get(hass)
+    for (domain, issue_id), issue in list(registry.issues.items()):
+        if domain != DOMAIN or not issue_id.startswith(_STALE_DATA_ISSUE_PREFIX):
+            continue
+        data = issue.data or {}
+        if data.get("tracker_id") == tracker_id or (
+            data.get("tracker_id") is None
+            and old_entry_id is not None
+            and data.get("entry_id") == old_entry_id
+        ):
+            ir.async_delete_issue(hass, DOMAIN, issue_id)
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Ask what to do with the archived data when an entry is truly removed.
+
+    Nothing is deleted here: HA unloads the entry (which already unsubscribed
+    the state listener) before calling this hook, and the repair issue created
+    below is resolved by the repairs confirmation flow. Unload, reload, and
+    restart never reach this hook, so they never trigger purging.
+    """
+    data = hass.data.get(DOMAIN)
+    store: Store | None = data.get("store") if isinstance(data, dict) else None
+    entity_id = (entry.data.get(CONF_ENTITY_ID) or "").lower()
+    tracker_id: int | None = None
+    if store is not None:
+        with contextlib.suppress(StoreError):
+            tracker_id = await store.async_get_tracker_id(entry.entry_id)
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        _stale_data_issue_id(entry.entry_id),
+        is_fixable=True,
+        severity=IssueSeverity.WARNING,
+        translation_key="stale_timeline_data",
+        data={
+            "entry_id": entry.entry_id,
+            "entity_id": entity_id,
+            "tracker_id": tracker_id,
+        },
+        translation_placeholders={"entity_id": entity_id},
+    )
+    _LOGGER.debug(
+        "GPS Timeline entry %s (%s) removed; archived data kept until purged or adopted",
+        entry.entry_id,
+        entity_id,
+    )

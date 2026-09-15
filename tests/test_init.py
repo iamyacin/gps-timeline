@@ -11,6 +11,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.gps_timeline.const import (
     CONF_ACCURACY_THRESHOLD,
     CONF_ACTIVITY_ENTITY,
+    CONF_ATTACH_TRACKER_ID,
     CONF_ENTITY_ID,
     CONF_PLACES_ENTITY,
     DB_DIR_NAME,
@@ -334,3 +335,142 @@ async def test_unload_reload_keeps_history_under_same_tracker_id(hass):
     now = dt_util.utcnow().timestamp()
     result = await store.async_query_states(["device_tracker.phone"], now - 3600, now + 3600)
     assert len(result["device_tracker.phone"]) == 1
+
+
+def stale_issue_id(entry_id):
+    return f"stale_timeline_data_{entry_id}"
+
+
+async def test_remove_entry_creates_repair_issue_and_keeps_data(hass):
+    entry1 = await setup_entry(hass)
+    hass.states.async_set(
+        "device_tracker.tablet",
+        "not_home",
+        {**TRACKER_ATTRS, "latitude": 51.0, "longitude": 9.0},
+    )
+    entry2 = await setup_entry(hass, entity_id="device_tracker.tablet")
+    hass.states.async_set("device_tracker.phone", "not_home", TRACKER_ATTRS)
+    await flush_store(hass)
+    tracker_id = tracker_id_for(hass, "device_tracker.phone")
+
+    assert await hass.config_entries.async_remove(entry1.entry_id)
+    await hass.async_block_till_done()
+
+    registry = ir.async_get(hass)
+    issue = registry.issues.get((DOMAIN, stale_issue_id(entry1.entry_id)))
+    assert issue is not None
+    assert issue.is_fixable
+    assert issue.severity.value == "warning"
+    assert issue.translation_key == "stale_timeline_data"
+    assert issue.data["entry_id"] == entry1.entry_id
+    assert issue.data["entity_id"] == "device_tracker.phone"
+    assert issue.data["tracker_id"] == tracker_id
+
+    assert tracker_id_for(hass, "device_tracker.phone") == tracker_id
+    conn = sqlite3.connect(str(Path(hass.config.path(DB_DIR_NAME, DB_FILE_NAME))))
+    assert conn.execute("SELECT COUNT(*) FROM points").fetchone()[0] == 1
+    conn.close()
+
+    # The second entry stays loaded: its removal must not produce a purge.
+    assert await hass.config_entries.async_remove(entry2.entry_id)
+    await hass.async_block_till_done()
+    assert tracker_id_for(hass, "device_tracker.tablet") is not None
+
+
+async def test_remove_last_entry_issue_has_no_tracker_id(hass):
+    entry = await setup_entry(hass)
+    assert await hass.config_entries.async_remove(entry.entry_id)
+    await hass.async_block_till_done()
+
+    registry = ir.async_get(hass)
+    issue = registry.issues.get((DOMAIN, stale_issue_id(entry.entry_id)))
+    assert issue is not None
+    assert issue.data["tracker_id"] is None
+    assert DOMAIN not in hass.data or "store" not in hass.data.get(DOMAIN, {})
+
+
+async def test_two_removed_entries_get_distinct_issues(hass):
+    entry1 = await setup_entry(hass)
+    hass.states.async_set(
+        "device_tracker.tablet",
+        "not_home",
+        {**TRACKER_ATTRS, "latitude": 51.0, "longitude": 9.0},
+    )
+    entry2 = await setup_entry(hass, entity_id="device_tracker.tablet")
+
+    assert await hass.config_entries.async_remove(entry1.entry_id)
+    await hass.async_block_till_done()
+    assert await hass.config_entries.async_remove(entry2.entry_id)
+    await hass.async_block_till_done()
+
+    registry = ir.async_get(hass)
+    assert set(registry.issues) >= {
+        (DOMAIN, stale_issue_id(entry1.entry_id)),
+        (DOMAIN, stale_issue_id(entry2.entry_id)),
+    }
+    conn = sqlite3.connect(str(Path(hass.config.path(DB_DIR_NAME, DB_FILE_NAME))))
+    assert conn.execute("SELECT COUNT(*) FROM trackers").fetchone()[0] == 2
+    conn.close()
+
+
+async def test_unload_and_reload_create_no_issue(hass):
+    entry = await setup_entry(hass)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    registry = ir.async_get(hass)
+    assert not any(
+        issue_id.startswith("stale_timeline_data_") for (_, issue_id) in registry.issues
+    )
+
+
+async def test_setup_adopts_orphan_and_clears_issue(hass):
+    entry1 = await setup_entry(hass)
+    hass.states.async_set("device_tracker.phone", "not_home", TRACKER_ATTRS)
+    await flush_store(hass)
+    tracker_id = tracker_id_for(hass, "device_tracker.phone")
+
+    db_path = Path(hass.config.path(DB_DIR_NAME, DB_FILE_NAME))
+    conn = sqlite3.connect(str(db_path))
+    before = conn.execute(
+        "SELECT ts, state FROM points WHERE tracker_id = ? ORDER BY ts", (tracker_id,)
+    ).fetchall()
+    conn.close()
+    assert before
+
+    assert await hass.config_entries.async_remove(entry1.entry_id)
+    await hass.async_block_till_done()
+    assert (DOMAIN, stale_issue_id(entry1.entry_id)) in ir.async_get(hass).issues
+
+    entry2 = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_ENTITY_ID: "device_tracker.phone_new",
+            CONF_PLACES_ENTITY: None,
+            CONF_ACTIVITY_ENTITY: None,
+            CONF_ACCURACY_THRESHOLD: 100,
+            CONF_ATTACH_TRACKER_ID: tracker_id,
+        },
+        title="GPS Timeline — Phone",
+    )
+    entry2.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry2.entry_id)
+    await hass.async_block_till_done()
+
+    assert tracker_id_for(hass, "device_tracker.phone_new") == tracker_id
+    conn = sqlite3.connect(str(db_path))
+    after = conn.execute(
+        "SELECT ts, state FROM points WHERE tracker_id = ? ORDER BY ts", (tracker_id,)
+    ).fetchall()
+    conn.close()
+    assert after == before
+
+    registry = ir.async_get(hass)
+    assert not any(
+        issue_id.startswith("stale_timeline_data_") for (_, issue_id) in registry.issues
+    )

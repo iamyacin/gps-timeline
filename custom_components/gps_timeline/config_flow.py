@@ -9,14 +9,18 @@ from homeassistant.helpers.selector import (
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
+    SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
 )
+from homeassistant.util import dt as dt_util
 import voluptuous as vol
 
 from .const import (
+    ATTACH_START_FRESH,
     CONF_ACCURACY_THRESHOLD,
     CONF_ACTIVITY_ENTITY,
+    CONF_ATTACH_TRACKER_ID,
     CONF_ENTITY_ID,
     CONF_PLACES_ENTITY,
     CONF_SUBJECT_KIND,
@@ -24,6 +28,7 @@ from .const import (
     DEFAULT_ACCURACY_THRESHOLD,
     DOMAIN,
 )
+from .helpers import async_get_orphans
 
 SOURCE_ENTITY_SELECTOR = EntitySelector()
 COMPANION_ENTITY_SELECTOR = EntitySelector()
@@ -87,6 +92,28 @@ def has_coordinates(state: State | None) -> bool:
     return isinstance(latitude, (int, float)) and isinstance(longitude, (int, float))
 
 
+def format_orphan_label(orphan: dict[str, Any]) -> str:
+    """Build the rich chooser label, e.g.
+
+    ``Yacin (person) — device_tracker.phone — 4,213 points — last: 2026-06-01``.
+    """
+    parts: list[str] = []
+    if orphan.get("subject_name"):
+        kind = orphan.get("subject_kind") or "subject"
+        parts.append(f"{orphan['subject_name']} ({kind})")
+    parts.append(orphan["entity_id"])
+    if orphan.get("point_count"):
+        parts.append(f"{orphan['point_count']:,} points")
+        if orphan.get("last_ts"):
+            last = dt_util.as_local(dt_util.utc_from_timestamp(orphan["last_ts"])).strftime(
+                "%Y-%m-%d"
+            )
+            parts.append(f"last: {last}")
+    else:
+        parts.append("no archived points")
+    return " — ".join(parts)
+
+
 def merged_entry_data(entry: config_entries.ConfigEntry) -> dict[str, Any]:
     merged = {**entry.data, **entry.options}
     return {key: value for key, value in merged.items() if value is not None}
@@ -122,6 +149,9 @@ class GPSTimelineConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
+    _pending_data: dict[str, Any] | None = None
+    _attach_friendly_name: str = ""
+
     async def async_step_user(self, user_input: dict[str, Any] | None = None):
         errors: dict[str, str] = {}
         if user_input is not None:
@@ -138,11 +168,80 @@ class GPSTimelineConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_ACTIVITY_ENTITY: user_input.get(CONF_ACTIVITY_ENTITY),
                     **normalize_subject(user_input),
                 }
+                if await async_get_orphans(self.hass):
+                    self._pending_data = data
+                    self._attach_friendly_name = str(friendly_name)
+                    return await self.async_step_attach()
                 return self.async_create_entry(
                     title=f"GPS Timeline — {friendly_name}",
                     data=data,
                 )
         return self.async_show_form(step_id="user", data_schema=TRACKER_SCHEMA, errors=errors)
+
+    async def async_step_attach(self, user_input: dict[str, Any] | None = None):
+        """Offer to attach the new entry to archived data left by a removed one."""
+        assert self._pending_data is not None
+        entity_id = str(self._pending_data[CONF_ENTITY_ID]).lower()
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            choice = user_input.get(CONF_ATTACH_TRACKER_ID)
+            if choice in (None, "", ATTACH_START_FRESH):
+                data = {**self._pending_data, CONF_ATTACH_TRACKER_ID: None}
+                return self.async_create_entry(
+                    title=f"GPS Timeline — {self._attach_friendly_name}",
+                    data=data,
+                )
+            orphans = await async_get_orphans(self.hass)
+            chosen = next(
+                (orphan for orphan in orphans if str(orphan["tracker_id"]) == str(choice)),
+                None,
+            )
+            if chosen is None:
+                # The picked orphan vanished (purged meanwhile); re-show the
+                # chooser so the list is current.
+                errors["base"] = "orphan_unavailable"
+            elif any(
+                orphan["entity_id"] == entity_id
+                and int(orphan["tracker_id"]) != int(chosen["tracker_id"])
+                for orphan in orphans
+            ):
+                errors["base"] = "adopt_conflict"
+            else:
+                data = {
+                    **self._pending_data,
+                    CONF_ATTACH_TRACKER_ID: int(chosen["tracker_id"]),
+                }
+                return self.async_create_entry(
+                    title=f"GPS Timeline — {self._attach_friendly_name}",
+                    data=data,
+                )
+        orphans = await async_get_orphans(self.hass)
+        options = [
+            SelectOptionDict(
+                value=str(orphan["tracker_id"]), label=format_orphan_label(orphan)
+            )
+            for orphan in orphans
+        ]
+        options.append(
+            SelectOptionDict(
+                value=ATTACH_START_FRESH, label="Start fresh (ignore archived data)"
+            )
+        )
+        matched = next(
+            (orphan for orphan in orphans if orphan["entity_id"] == entity_id), None
+        )
+        default = str(matched["tracker_id"]) if matched else ATTACH_START_FRESH
+        return self.async_show_form(
+            step_id="attach",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_ATTACH_TRACKER_ID, default=default): SelectSelector(
+                        SelectSelectorConfig(options=options)
+                    )
+                }
+            ),
+            errors=errors,
+        )
 
     async def async_step_reconfigure(self, user_input: dict[str, Any] | None = None):
         entry = self._get_reconfigure_entry()

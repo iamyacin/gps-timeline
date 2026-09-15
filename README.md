@@ -5,13 +5,13 @@
   <img src="custom_components/gps_timeline/brand/logo.png" alt="GPS Timeline" width="200">
 </picture>
 
-**GPS Timeline** is a Home Assistant integration that archives the location history of your trackers into a dedicated SQLite database that is **never purged**, and serves that history back to dashboards through a WebSocket API — unlocking unlimited history depth for the [Location Timeline Card](https://community.home-assistant.io/t/location-timeline-card-to-easily-show-location-history/989513).
+**GPS Timeline** is a Home Assistant integration that archives the location history of your trackers into a dedicated SQLite database that is **only deleted when you confirm it**, and serves that history back to dashboards through a WebSocket API — unlocking unlimited history depth for the [Location Timeline Card](https://community.home-assistant.io/t/location-timeline-card-to-easily-show-location-history/989513).
 
 By default, Home Assistant's recorder keeps entity history for only 10 days (`purge_keep_days`), and there is no per-entity retention option. GPS Timeline fixes that for location data: every GPS fix is stored in its own SQLite database with full attribute fidelity and stays there forever.
 
 ## Features
 
-- **Permanent GPS history** — points are stored in a dedicated SQLite database (`<config>/gps_timeline/gps_timeline.db`) and never purged.
+- **Permanent GPS history** — points are stored in a dedicated SQLite database (`<config>/gps_timeline/gps_timeline.db`) and only deleted when you confirm it (removing a tracker asks whether to also delete its archived data; orphaned history can be re-attached when the subject is added again).
 - **Any entity with coordinates** — track `device_tracker.*`, `person.*` or any entity exposing `latitude`/`longitude` attributes.
 - **Maximum fidelity** — every accepted fix is stored with all its attributes (accuracy, battery, speed, altitude, course, and anything else the source reports) as a full snapshot.
 - **Multiple users and devices** — add one configuration entry per tracked device; every entry can also archive its Places and activity sensors.

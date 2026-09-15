@@ -231,7 +231,11 @@ def _filter_significant_changes(items: list[dict[str, Any]]) -> list[dict[str, A
 
 
 class Store:
-    """SQLite storage for GPS timeline points, never purged."""
+    """SQLite storage for GPS timeline points.
+
+    Rows are kept forever until explicitly purged (repair confirmation flow or
+    the ``gps_timeline.purge`` service); nothing is ever deleted automatically.
+    """
 
     def __init__(self, hass: HomeAssistant, db_path: str) -> None:
         self._hass = hass
@@ -240,6 +244,7 @@ class Store:
         self._conn_lock = threading.Lock()
         self._pending_points: list[tuple[int, tuple]] = []
         self._pending_states: list[tuple[int, tuple]] = []
+        self._dropped_trackers: set[int] = set()
         self._flush_task: asyncio.Task | None = None
         self._retry_tasks: set[asyncio.Task] = set()
         self._flush_failure_count = 0
@@ -369,6 +374,40 @@ class Store:
         self._retry_tasks.add(task)
         task.add_done_callback(self._retry_tasks.discard)
 
+    @callback
+    def _drop_pending_rows(self, tracker_id: int) -> None:
+        """Forget pending queued rows for a purged tracker.
+
+        ``INSERT OR IGNORE`` does not suppress FK violations, so queued rows for
+        a deleted tracker would fail on flush, requeue, and retry forever.
+        Safe: the tracker's listener was unsubscribed before its entry was
+        removed, so nothing new can arrive for it.
+        """
+        self._dropped_trackers.add(tracker_id)
+        self._pending_points = [
+            (tid, row) for tid, row in self._pending_points if tid != tracker_id
+        ]
+        self._pending_states = [
+            (tid, entity_id, row)
+            for tid, entity_id, row in self._pending_states
+            if tid != tracker_id
+        ]
+
+    def _filter_dropped_rows(
+        self,
+        points: list[tuple[int, tuple]],
+        states: list[tuple[int, tuple]],
+    ) -> tuple[list[tuple[int, tuple]], list[tuple[int, tuple]]]:
+        """Skip rows that reference a tracker purged mid-flight."""
+        if self._dropped_trackers:
+            points = [(tid, row) for tid, row in points if tid not in self._dropped_trackers]
+            states = [
+                (tid, entity_id, row)
+                for tid, entity_id, row in states
+                if tid not in self._dropped_trackers
+            ]
+        return points, states
+
     async def async_flush(self, *, final: bool = False) -> None:
         if self._closed and not final:
             return
@@ -396,6 +435,7 @@ class Store:
     def _requeue(
         self, points: list[tuple[int, tuple]], states: list[tuple[int, tuple]]
     ) -> None:
+        points, states = self._filter_dropped_rows(points, states)
         self._pending_points[:0] = points
         self._pending_states[:0] = states
         for name, pending in (
@@ -410,19 +450,20 @@ class Store:
                 )
 
     def _write(self, points: list[tuple[int, tuple]], states: list[tuple[int, tuple]]) -> None:
+        points, states = self._filter_dropped_rows(points, states)
+        if not points and not states:
+            return
         with self._conn_lock:
             if self._conn is None:
                 raise StoreError("Store is not set up")
-            if points:
-                self._conn.executemany(
-                    _INSERT_POINT_SQL,
-                    [(tracker_id, *row) for tracker_id, row in points],
-                )
-            if states:
-                self._conn.executemany(
-                    _INSERT_ENTITY_STATE_SQL,
-                    [(tracker_id, entity_id, *row) for tracker_id, entity_id, row in states],
-                )
+            self._conn.executemany(
+                _INSERT_POINT_SQL,
+                [(tracker_id, *row) for tracker_id, row in points],
+            )
+            self._conn.executemany(
+                _INSERT_ENTITY_STATE_SQL,
+                [(tracker_id, entity_id, *row) for tracker_id, entity_id, row in states],
+            )
             self._conn.commit()
             _LOGGER.debug("Flushed %s points and %s entity states", len(points), len(states))
 
@@ -439,32 +480,291 @@ class Store:
     def _write_backfill(
         self, points: list[tuple[int, tuple]], states: list[tuple[int, tuple]]
     ) -> tuple[int, int]:
+        points, states = self._filter_dropped_rows(points, states)
+        if not points and not states:
+            return (0, 0)
         with self._conn_lock:
             if self._conn is None:
                 raise StoreError("Store is not set up")
             before = self._conn.total_changes
-            if points:
-                self._conn.executemany(
-                    _INSERT_POINT_SQL,
-                    [(tracker_id, *row) for tracker_id, row in points],
-                )
-            if states:
-                self._conn.executemany(
-                    _INSERT_ENTITY_STATE_SQL,
-                    [(tracker_id, entity_id, *row) for tracker_id, entity_id, row in states],
-                )
+            self._conn.executemany(
+                _INSERT_POINT_SQL,
+                [(tracker_id, *row) for tracker_id, row in points],
+            )
+            self._conn.executemany(
+                _INSERT_ENTITY_STATE_SQL,
+                [(tracker_id, entity_id, *row) for tracker_id, entity_id, row in states],
+            )
             self._conn.commit()
             inserted = self._conn.total_changes - before
         return (inserted, len(points) + len(states))
 
-    async def async_bind_tracker(self, entry_id: str | None, entity_id: str) -> int:
-        return await asyncio.to_thread(self._bind_tracker, entry_id, entity_id.lower())
+    async def async_purge_tracker(
+        self,
+        entry_id: str | None = None,
+        *,
+        tracker_id: int | None = None,
+        live_entity_claims: dict[str, str] | None = None,
+    ) -> dict[str, int]:
+        """Delete a tracker row and all related rows in one transaction.
 
-    def _bind_tracker(self, entry_id: str | None, entity_id: str) -> int:
+        Exactly one of ``entry_id`` / ``tracker_id`` must be provided. Both
+        ``points`` and ``entity_states`` rows cascade-delete via foreign keys;
+        ``live_entity_claims`` (entity id -> owning entry id) protects companion
+        history still tracked by a live entry by re-stamping those rows to the
+        surviving tracker instead of letting them cascade-delete.
+
+        Returns affected row counts for logging.
+        """
+        if (entry_id is None) == (tracker_id is None):
+            raise ValueError("Provide exactly one of entry_id or tracker_id")
+        if tracker_id is not None:
+            self._drop_pending_rows(tracker_id)
+        try:
+            target_id, counts = await asyncio.to_thread(
+                self._purge_tracker, entry_id, tracker_id, live_entity_claims
+            )
+        except sqlite3.DatabaseError as err:
+            target = entry_id or tracker_id
+            raise StoreError(f"Could not purge tracker {target}: {err}") from err
+        if entry_id is not None and target_id is not None:
+            self._drop_pending_rows(target_id)
+        return counts
+
+    def _purge_tracker(
+        self,
+        entry_id: str | None,
+        tracker_id: int | None,
+        live_entity_claims: dict[str, str] | None,
+    ) -> tuple[int | None, dict[str, int]]:
         with self._conn_lock:
             if self._conn is None:
                 raise StoreError("Store is not set up")
             conn = self._conn
+            if entry_id is not None:
+                row = conn.execute(
+                    "SELECT id FROM trackers WHERE entry_id = ?", (entry_id,)
+                ).fetchone()
+                bound_entry_id = entry_id
+            else:
+                assert tracker_id is not None
+                row = conn.execute(
+                    "SELECT entry_id FROM trackers WHERE id = ?", (tracker_id,)
+                ).fetchone()
+                bound_entry_id = row[0] if row else None
+            if row is None:
+                return (None, {"trackers": 0, "points": 0, "entity_states": 0})
+            target_id = int(row[0] if entry_id is not None else tracker_id)
+            if (
+                entry_id is None
+                and bound_entry_id is not None
+                and (bound_entry_id in set((live_entity_claims or {}).values()))
+            ):
+                raise StoreError(
+                    "Tracker data is claimed by a live GPS Timeline entry"
+                    " and cannot be purged directly"
+                )
+            if live_entity_claims:
+                for entity_id, owner_entry_id in live_entity_claims.items():
+                    survivor = conn.execute(
+                        "SELECT id FROM trackers WHERE entry_id = ?", (owner_entry_id,)
+                    ).fetchone()
+                    if survivor is None:
+                        continue
+                    conn.execute(
+                        "UPDATE entity_states SET tracker_id = ?"
+                        " WHERE tracker_id = ? AND entity_id = ?",
+                        (int(survivor[0]), target_id, entity_id),
+                    )
+            points = conn.execute(
+                "SELECT COUNT(*) FROM points WHERE tracker_id = ?", (target_id,)
+            ).fetchone()[0]
+            states = conn.execute(
+                "SELECT COUNT(*) FROM entity_states WHERE tracker_id = ?", (target_id,)
+            ).fetchone()[0]
+            conn.execute("DELETE FROM trackers WHERE id = ?", (target_id,))
+            conn.commit()
+        _LOGGER.info(
+            "Purged tracker %s (entry %s): %s points, %s entity states",
+            target_id,
+            bound_entry_id,
+            points,
+            states,
+        )
+        return (
+            target_id,
+            {
+                "trackers": 1,
+                "points": int(points),
+                "entity_states": int(states),
+            },
+        )
+
+    async def async_list_orphans(
+        self, live_entry_ids: list[str], claimed_entity_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        """Return tracker rows not referenced by any live config entry."""
+        return await asyncio.to_thread(self._list_orphans, live_entry_ids, claimed_entity_ids)
+
+    def _list_orphans(
+        self, live_entry_ids: list[str], claimed_entity_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        with self._conn_lock:
+            if self._conn is None:
+                raise StoreError("Store is not set up")
+            conditions: list[str] = []
+            params: list[Any] = []
+            known_entries = [entry_id for entry_id in live_entry_ids if entry_id]
+            if known_entries:
+                conditions.append(
+                    "(entry_id IS NOT NULL AND entry_id NOT IN"
+                    f" ({','.join('?' * len(known_entries))}))"
+                )
+                params.extend(known_entries)
+            else:
+                conditions.append("entry_id IS NOT NULL")
+            known_entities = [
+                entity_id.lower() for entity_id in claimed_entity_ids if entity_id
+            ]
+            if known_entities:
+                conditions.append(
+                    "(entry_id IS NULL AND entity_id NOT IN"
+                    f" ({','.join('?' * len(known_entities))}))"
+                )
+                params.extend(known_entities)
+            else:
+                conditions.append("entry_id IS NULL")
+            rows = self._conn.execute(
+                "SELECT id, entity_id, subject_kind, subject_name, created_at, entry_id,"
+                " (SELECT COUNT(*) FROM points p WHERE p.tracker_id = t.id),"
+                " (SELECT MAX(ts) FROM points p WHERE p.tracker_id = t.id)"
+                f" FROM trackers t WHERE {' OR '.join(conditions)}"
+                " ORDER BY entity_id",
+                params,
+            ).fetchall()
+        return [
+            {
+                "tracker_id": int(row[0]),
+                "entity_id": row[1],
+                "subject_kind": row[2],
+                "subject_name": row[3],
+                "created_at": row[4],
+                "entry_id": row[5],
+                "point_count": int(row[6]),
+                "last_ts": float(row[7]) if row[7] is not None else None,
+            }
+            for row in rows
+        ]
+
+    async def async_get_tracker(self, tracker_id: int) -> dict[str, Any] | None:
+        """Return id/entry_id/entity_id for a tracker row, or None."""
+        return await asyncio.to_thread(self._get_tracker, int(tracker_id))
+
+    def _get_tracker(self, tracker_id: int) -> dict[str, Any] | None:
+        with self._conn_lock:
+            if self._conn is None:
+                raise StoreError("Store is not set up")
+            row = self._conn.execute(
+                "SELECT id, entry_id, entity_id FROM trackers WHERE id = ?", (tracker_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {"tracker_id": int(row[0]), "entry_id": row[1], "entity_id": row[2]}
+
+    async def async_get_tracker_id(self, entry_id: str) -> int | None:
+        """Return the tracker row id bound to a config entry, or None."""
+        return await asyncio.to_thread(self._get_tracker_id, entry_id)
+
+    def _get_tracker_id(self, entry_id: str) -> int | None:
+        with self._conn_lock:
+            if self._conn is None:
+                raise StoreError("Store is not set up")
+            row = self._conn.execute(
+                "SELECT id FROM trackers WHERE entry_id = ?", (entry_id,)
+            ).fetchone()
+        return int(row[0]) if row else None
+
+    async def async_get_tracker_by_entity(self, entity_id: str) -> dict[str, Any] | None:
+        """Return the tracker row owning an entity id, or None."""
+        return await asyncio.to_thread(self._get_tracker_by_entity, entity_id.lower())
+
+    def _get_tracker_by_entity(self, entity_id: str) -> dict[str, Any] | None:
+        with self._conn_lock:
+            if self._conn is None:
+                raise StoreError("Store is not set up")
+            row = self._conn.execute(
+                "SELECT id, entry_id FROM trackers WHERE entity_id = ?", (entity_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {"tracker_id": int(row[0]), "entry_id": row[1], "entity_id": entity_id}
+
+    async def async_adopt_orphan(
+        self,
+        tracker_id: int,
+        entry_id: str,
+        entity_id: str,
+        subject: tuple[str, str] | None = None,
+        *,
+        live_entry_ids: list[str] | None = None,
+    ) -> int:
+        """Attach an orphaned tracker row to a live entry.
+
+        Updates ``entry_id``, ``entity_id`` and the subject columns in one
+        transaction; afterwards the row is bound and stops being an orphan.
+        The target must still be an orphan — adopting an already-bound row is
+        rejected.
+        """
+        return await asyncio.to_thread(
+            self._adopt_orphan,
+            int(tracker_id),
+            entry_id,
+            entity_id.lower(),
+            subject,
+            live_entry_ids,
+            True,
+        )
+
+    async def async_bind_tracker(
+        self,
+        entry_id: str | None,
+        entity_id: str,
+        *,
+        adopt_tracker_id: int | None = None,
+        live_entry_ids: list[str] | None = None,
+    ) -> int:
+        return await asyncio.to_thread(
+            self._bind_tracker,
+            entry_id,
+            entity_id.lower(),
+            adopt_tracker_id,
+            live_entry_ids,
+        )
+
+    def _bind_tracker(
+        self,
+        entry_id: str | None,
+        entity_id: str,
+        adopt_tracker_id: int | None = None,
+        live_entry_ids: list[str] | None = None,
+    ) -> int:
+        with self._conn_lock:
+            if self._conn is None:
+                raise StoreError("Store is not set up")
+            conn = self._conn
+            if adopt_tracker_id is not None:
+                if entry_id is None:
+                    raise StoreError("Adopting a tracker requires an entry id")
+                self._adopt_orphan_locked(
+                    conn,
+                    adopt_tracker_id,
+                    entry_id,
+                    entity_id,
+                    None,
+                    live_entry_ids,
+                    False,
+                )
+                return adopt_tracker_id
             if entry_id is not None:
                 row = conn.execute(
                     "SELECT id, entity_id FROM trackers WHERE entry_id = ?", (entry_id,)
@@ -525,7 +825,91 @@ class Store:
                 raise StoreError(
                     f"Entity {entity_id} is already owned by another GPS Timeline tracker"
                 ) from err
+            self._dropped_trackers.discard(int(cursor.lastrowid))
             return int(cursor.lastrowid)
+
+    def _adopt_orphan(
+        self,
+        tracker_id: int,
+        entry_id: str,
+        entity_id: str,
+        subject: tuple[str, str] | None,
+        live_entry_ids: list[str] | None,
+        update_subject: bool,
+    ) -> int:
+        with self._conn_lock:
+            if self._conn is None:
+                raise StoreError("Store is not set up")
+            self._adopt_orphan_locked(
+                self._conn,
+                tracker_id,
+                entry_id,
+                entity_id,
+                subject,
+                live_entry_ids,
+                update_subject,
+            )
+        return tracker_id
+
+    def _adopt_orphan_locked(
+        self,
+        conn: sqlite3.Connection,
+        tracker_id: int,
+        entry_id: str,
+        entity_id: str,
+        subject: tuple[str, str] | None,
+        live_entry_ids: list[str] | None,
+        update_subject: bool,
+    ) -> None:
+        row = conn.execute(
+            "SELECT entity_id, entry_id, subject_kind, subject_name FROM trackers"
+            " WHERE id = ?",
+            (tracker_id,),
+        ).fetchone()
+        if row is None:
+            raise StoreError(
+                "Archived tracker no longer exists; the data may have been purged meanwhile"
+            )
+        current_entity_id, bound_entry_id, current_kind, current_name = row
+        if (
+            bound_entry_id is not None
+            and bound_entry_id != entry_id
+            and live_entry_ids is not None
+            and bound_entry_id in live_entry_ids
+        ):
+            raise StoreError(
+                f"Tracker {tracker_id} is already claimed by another GPS Timeline entry"
+            )
+        if (
+            conn.execute(
+                "SELECT id FROM trackers WHERE entity_id = ? AND id != ?",
+                (entity_id, tracker_id),
+            ).fetchone()
+            is not None
+        ):
+            raise StoreError(
+                f"Entity {entity_id} is already owned by another GPS Timeline tracker"
+            )
+        if update_subject:
+            kind, name = subject if subject else (None, None)
+            if not kind or not name:
+                kind = None
+                name = None
+        else:
+            kind, name = current_kind, current_name
+        conn.execute(
+            "UPDATE trackers SET entry_id = ?, entity_id = ?, subject_kind = ?,"
+            " subject_name = ? WHERE id = ?",
+            (entry_id, entity_id, kind, name, tracker_id),
+        )
+        conn.commit()
+        _LOGGER.info(
+            "Adopted archived tracker %s (%s) into entry %s as %s",
+            tracker_id,
+            current_entity_id,
+            entry_id,
+            entity_id,
+        )
 
     async def async_set_subject(
         self, entry_id: str, kind: str | None, name: str | None
@@ -791,3 +1175,51 @@ class Store:
             if self._conn is not None:
                 self._conn.close()
                 self._conn = None
+
+
+async def _run_standalone(hass: HomeAssistant, db_path: str, action) -> Any:
+    """Run an action against a short-lived store connection.
+
+    For use when no live store exists (fresh start, first entry ever, or after
+    the last entry was removed): opens the database, runs the action, and
+    closes again, mirroring the normal setup/close path (pragmas, migrations,
+    corrupt-DB recovery) without listeners or flush logic.
+    """
+    store = Store(hass, db_path)
+    await store.async_setup()
+    try:
+        return await action(store)
+    finally:
+        await store.async_close()
+
+
+async def async_purge_tracker_standalone(
+    hass: HomeAssistant,
+    db_path: str,
+    entry_id: str | None = None,
+    *,
+    tracker_id: int | None = None,
+    live_entity_claims: dict[str, str] | None = None,
+) -> dict[str, int]:
+    """Purge a tracker through a short-lived connection (store not running)."""
+    return await _run_standalone(
+        hass,
+        db_path,
+        lambda store: store.async_purge_tracker(
+            entry_id, tracker_id=tracker_id, live_entity_claims=live_entity_claims
+        ),
+    )
+
+
+async def async_list_orphans_standalone(
+    hass: HomeAssistant,
+    db_path: str,
+    live_entry_ids: list[str],
+    claimed_entity_ids: list[str],
+) -> list[dict[str, Any]]:
+    """List orphans through a short-lived connection (store not running)."""
+    return await _run_standalone(
+        hass,
+        db_path,
+        lambda store: store.async_list_orphans(live_entry_ids, claimed_entity_ids),
+    )
