@@ -1,8 +1,8 @@
 # GPS Timeline
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="custom_components/gps_timeline/brand/dark_logo.png">
-  <img src="custom_components/gps_timeline/brand/logo.png" alt="GPS Timeline" width="200">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/iamyacin/gps-timeline/main/custom_components/gps_timeline/brand/dark_logo.png">
+  <img src="https://raw.githubusercontent.com/iamyacin/gps-timeline/main/custom_components/gps_timeline/brand/logo.png" alt="GPS Timeline" width="200">
 </picture>
 
 **GPS Timeline** is a Home Assistant integration that archives the location history of your trackers into a dedicated SQLite database that is **only deleted when you confirm it**, and serves that history back to dashboards through a WebSocket API — unlocking unlimited history depth for the [Location Timeline Card](https://community.home-assistant.io/t/location-timeline-card-to-easily-show-location-history/989513).
